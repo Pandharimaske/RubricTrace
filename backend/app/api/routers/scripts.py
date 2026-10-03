@@ -17,8 +17,8 @@ from backend.app.db.database import (
     upsert_student,
 )
 from backend.app.db.exams import get_exam
-from backend.app.services.models.ollama import ModelUnavailable
-from backend.app.services.ocr.process import process_script_file
+from backend.app.services.assessment.extraction.process import process_script_file
+from backend.app.services.assessment.llm.ollama import ModelUnavailable
 from backend.app.services.storage import delete_upload, save_upload
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse

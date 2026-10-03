@@ -26,8 +26,8 @@ import os
 import re
 from typing import Any
 
-from backend.app.services.models.provider import ModelClient, get_llm_client_and_model
-from backend.app.services.models.structured import (
+from backend.app.services.assessment.llm.provider import ModelClient, get_llm_client_and_model
+from backend.app.services.assessment.llm.structured import (
     GraderOutput,
     MCQGraderOutput,
     generate_structured,

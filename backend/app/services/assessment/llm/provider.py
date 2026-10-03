@@ -20,7 +20,7 @@ import json
 import os
 from typing import Any, Protocol, runtime_checkable
 
-from backend.app.services.models.ollama import OllamaClient
+from backend.app.services.assessment.llm.ollama import OllamaClient
 
 
 @runtime_checkable
@@ -77,7 +77,7 @@ def _nvidia_vlm_extra_body() -> dict[str, Any] | None:
 def get_vlm_client_and_model() -> tuple[ModelClient, str]:
     """Client + model name to use for reading exam pages (vision)."""
     if _provider() == "nvidia":
-        from backend.app.services.models.nvidia import NvidiaClient
+        from backend.app.services.assessment.llm.nvidia import NvidiaClient
 
         model = os.getenv("RUBRICTRACE_NVIDIA_VLM_MODEL", _DEFAULT_NVIDIA_VLM_MODEL)
         return NvidiaClient(extra_body=_nvidia_vlm_extra_body()), model
@@ -99,13 +99,13 @@ def get_vlm_client_and_model() -> tuple[ModelClient, str]:
 def get_llm_client_and_model() -> tuple[ModelClient, str]:
     """Client + model name to use for grading (text)."""
     if _provider() == "nvidia":
-        from backend.app.services.models.nvidia import NvidiaClient
+        from backend.app.services.assessment.llm.nvidia import NvidiaClient
 
         model = os.getenv("RUBRICTRACE_NVIDIA_LLM_MODEL", _DEFAULT_NVIDIA_LLM_MODEL)
         return NvidiaClient(), model
 
     if _provider() == "groq":
-        from backend.app.services.models.groq import GroqClient
+        from backend.app.services.assessment.llm.groq import GroqClient
 
         model = os.getenv("RUBRICTRACE_GROQ_LLM_MODEL", _DEFAULT_GROQ_LLM_MODEL)
         return GroqClient(), model

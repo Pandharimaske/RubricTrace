@@ -13,10 +13,10 @@ from backend.app.models.schemas import (
     TeacherEvaluationRequest,
     TeacherOverrideRequest,
 )
-from backend.app.services.evaluation.pipeline import evaluate_teacher_config
-from backend.app.services.evaluation.repository import load_evaluation, save_evaluation
-from backend.app.services.models.ollama import ModelUnavailable
-from backend.app.services.scoring.rubric import score_answer
+from backend.app.services.assessment.grading.rubric import score_answer
+from backend.app.services.assessment.jobs.pipeline import evaluate_teacher_config
+from backend.app.services.assessment.jobs.repository import load_evaluation, save_evaluation
+from backend.app.services.assessment.llm.ollama import ModelUnavailable
 from fastapi import APIRouter, HTTPException
 
 router = APIRouter(tags=["grading"])

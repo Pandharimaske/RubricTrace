@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.app.core.settings import PAGE_IMAGE_DIR, ensure_data_dirs
 from backend.app.db.database import get_db, update_script_status
-from backend.app.services.ocr.pdf import pdf_to_images
+from backend.app.services.assessment.extraction.pdf import pdf_to_images
 
 
 def main() -> None:

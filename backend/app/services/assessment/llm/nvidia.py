@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from backend.app.services.models.ollama import ModelUnavailable
+from backend.app.services.assessment.llm.ollama import ModelUnavailable
 
 
 class NvidiaClient:

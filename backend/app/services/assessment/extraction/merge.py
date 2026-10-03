@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from backend.app.services.ocr.segment import normalize_question_id
+from backend.app.services.assessment.extraction.segment import normalize_question_id
 
 
 def normalize_qid(raw: str) -> str:

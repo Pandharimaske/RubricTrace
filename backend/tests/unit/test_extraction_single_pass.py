@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from backend.app.services.models.extraction.pipeline import vlm_extract_questions
-from backend.app.services.models.structured import PageExtraction
+from backend.app.services.assessment.extraction.pipeline import vlm_extract_questions
+from backend.app.services.assessment.llm.structured import PageExtraction
 from PIL import Image, ImageDraw
 
 QUESTION_IDS = ["Q1", "Q2", "Q3"]

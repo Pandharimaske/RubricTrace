@@ -23,7 +23,7 @@ from backend.app.db.exams import (
     update_exam,
 )
 from backend.app.models.schemas import EvaluatorConfigCreate, ExamCreate, ExamUpdate, GradeRequest
-from backend.app.services.evaluation.exam_jobs import (
+from backend.app.services.assessment.jobs.exam_jobs import (
     JobConflict,
     NothingToDo,
     SetupRequired,

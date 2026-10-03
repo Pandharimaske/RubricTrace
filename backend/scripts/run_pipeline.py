@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.services.evaluation.pipeline import run_pipeline
+from backend.app.services.assessment.jobs.pipeline import run_pipeline
 
 
 def main() -> None:

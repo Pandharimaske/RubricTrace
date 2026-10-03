@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from backend.app.services.models.ollama import ModelUnavailable
+from backend.app.services.assessment.llm.ollama import ModelUnavailable
 
 if TYPE_CHECKING:
     from pydantic import BaseModel

@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 
 from backend.app.core.settings import PROCESSED_DIR
-from backend.app.services.models.structured import PageExtraction
+from backend.app.services.assessment.llm.structured import PageExtraction
 
 
 def _enabled() -> bool:

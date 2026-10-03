@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # Import settings to load .env file
 
-from backend.app.services.ocr.questions import extract_script_questions
+from backend.app.services.assessment.extraction.questions import extract_script_questions
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET_ROOT = (

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.app.services.models.ai_assistance import vlm_extract_questions
-from backend.app.services.ocr.pdf import pdf_to_images
-from backend.app.services.ocr.segment import normalize_question_id, segment_questions
+from backend.app.services.assessment.extraction.pdf import pdf_to_images
+from backend.app.services.assessment.extraction.pipeline import vlm_extract_questions
+from backend.app.services.assessment.extraction.segment import (
+    normalize_question_id,
+    segment_questions,
+)
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 

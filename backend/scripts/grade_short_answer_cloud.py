@@ -106,8 +106,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.app.core.settings import PROCESSED_DIR
 from backend.app.db.database import DEFAULT_REVIEW_THRESHOLD, clamp_review_threshold, review_verdict
-from backend.app.services.models.grader import llm_grade
-from backend.app.services.models.ollama import ModelUnavailable
+from backend.app.services.assessment.grading.grader import llm_grade
+from backend.app.services.assessment.llm.ollama import ModelUnavailable
 
 DEFAULT_CONCURRENCY = 4
 DEFAULT_PROVIDER_CHAIN = "nvidia,groq"
@@ -162,12 +162,12 @@ def _load_extracted_answers(path: Path) -> dict[tuple[str, str], str]:
 def _make_single_client(provider: str, model_override: str | None) -> tuple[Any, str]:
     provider = provider.strip().lower()
     if provider == "nvidia":
-        from backend.app.services.models.nvidia import NvidiaClient
+        from backend.app.services.assessment.llm.nvidia import NvidiaClient
 
         model = model_override or os.getenv("RUBRICTRACE_NVIDIA_LLM_MODEL", "openai/gpt-oss-20b")
         return NvidiaClient(), model
     if provider == "groq":
-        from backend.app.services.models.groq import GroqClient
+        from backend.app.services.assessment.llm.groq import GroqClient
 
         model = model_override or os.getenv("RUBRICTRACE_GROQ_LLM_MODEL", "openai/gpt-oss-20b")
         return GroqClient(), model

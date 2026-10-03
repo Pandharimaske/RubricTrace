@@ -18,8 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
-from backend.app.services.models.ollama import ModelUnavailable, parse_json_response
-from backend.app.services.models.provider import ModelClient
+from backend.app.services.assessment.llm.ollama import ModelUnavailable, parse_json_response
+from backend.app.services.assessment.llm.provider import ModelClient
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---- Output schemas -------------------------------------------------------

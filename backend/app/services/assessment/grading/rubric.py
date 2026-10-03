@@ -2,7 +2,7 @@
 
 from backend.app.db.database import DEFAULT_REVIEW_THRESHOLD, review_verdict
 from backend.app.models.schemas import CriterionScore, ScoreRequest, ScoreResponse
-from backend.app.services.models.grader import llm_grade
+from backend.app.services.assessment.grading.grader import llm_grade
 
 
 def score_answer(request: ScoreRequest) -> ScoreResponse:

@@ -9,7 +9,7 @@ strikeouts, continuations) between stages, and a digit misread in stage one beca
 stage two's ground truth.
 
 This is the only module in the extraction pipeline that talks to a model client.
-Prompt text lives in prompts/extraction.py; pure merge/validation logic lives in
+Prompt text lives in extraction/prompt.py; pure merge/validation logic lives in
 extraction/merge.py and extraction/review_flags.py; per-run counters live in
 extraction/metrics.py; the per-page result cache lives in extraction/cache.py.
 
@@ -47,10 +47,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from backend.app.services.models.extraction import cache
-from backend.app.services.models.extraction.merge import merge_questions, normalize_qid
-from backend.app.services.models.extraction.metrics import ExtractionMetrics
-from backend.app.services.models.extraction.review_flags import (
+from backend.app.services.assessment.extraction import cache
+from backend.app.services.assessment.extraction.blank_page import is_blank_page
+from backend.app.services.assessment.extraction.merge import merge_questions, normalize_qid
+from backend.app.services.assessment.extraction.metrics import ExtractionMetrics
+from backend.app.services.assessment.extraction.prompt import (
+    EXTRACTION_SYSTEM_PROMPT,
+    PROMPT_VERSION,
+    build_extraction_user_prompt,
+)
+from backend.app.services.assessment.extraction.review_flags import (
     extract_suspicious_duplicates,
     find_never_mentioned_ids,
     numbers_mentioned_in_transcript,
@@ -58,19 +64,13 @@ from backend.app.services.models.extraction.review_flags import (
     record_suspicious_duplicates,
     record_unassigned,
 )
-from backend.app.services.models.ollama import ModelUnavailable
-from backend.app.services.models.prompts.extraction import (
-    EXTRACTION_SYSTEM_PROMPT,
-    PROMPT_VERSION,
-    build_extraction_user_prompt,
-)
-from backend.app.services.models.provider import ModelClient, get_vlm_client_and_model
-from backend.app.services.models.structured import (
+from backend.app.services.assessment.llm.ollama import ModelUnavailable
+from backend.app.services.assessment.llm.provider import ModelClient, get_vlm_client_and_model
+from backend.app.services.assessment.llm.structured import (
     PageExtraction,
     VlmExtractionTranscription,
     generate_structured,
 )
-from backend.app.services.ocr.blank_page import is_blank_page
 
 # An answer the model marked illegible never counts as confident, whatever
 # number it reported.

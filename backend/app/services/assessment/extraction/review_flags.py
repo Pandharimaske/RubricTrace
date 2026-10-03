@@ -62,7 +62,7 @@ Four checks live here:
                                        there instead of being recognized as
                                        its own answer (see the shape-based
                                        digit-matching constraint in
-                                       prompts/extraction.py) — run once at
+                                       extraction/prompt.py) — run once at
                                        the end of vlm_extract_questions, after
                                        every page has been processed.
 """
@@ -72,7 +72,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from backend.app.services.models.extraction.merge import normalize_qid
+from backend.app.services.assessment.extraction.merge import normalize_qid
 
 _NUMBERED_ITEM = re.compile(r"(?im)^\s*\*{0,2}(?:question\s*)?(\d{1,3})\s*[.):]")
 
