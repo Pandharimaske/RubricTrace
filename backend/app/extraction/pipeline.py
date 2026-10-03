@@ -47,16 +47,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from backend.app.services.assessment.extraction import cache
-from backend.app.services.assessment.extraction.blank_page import is_blank_page
-from backend.app.services.assessment.extraction.merge import merge_questions, normalize_qid
-from backend.app.services.assessment.extraction.metrics import ExtractionMetrics
-from backend.app.services.assessment.extraction.prompt import (
+from backend.app.extraction import cache
+from backend.app.extraction.blank_page import is_blank_page
+from backend.app.extraction.merge import merge_questions, normalize_qid
+from backend.app.extraction.metrics import ExtractionMetrics
+from backend.app.extraction.prompt import (
     EXTRACTION_SYSTEM_PROMPT,
     PROMPT_VERSION,
     build_extraction_user_prompt,
 )
-from backend.app.services.assessment.extraction.review_flags import (
+from backend.app.extraction.review_flags import (
     extract_suspicious_duplicates,
     find_never_mentioned_ids,
     numbers_mentioned_in_transcript,
@@ -64,9 +64,9 @@ from backend.app.services.assessment.extraction.review_flags import (
     record_suspicious_duplicates,
     record_unassigned,
 )
-from backend.app.services.assessment.llm.ollama import ModelUnavailable
-from backend.app.services.assessment.llm.provider import ModelClient, get_vlm_client_and_model
-from backend.app.services.assessment.llm.structured import (
+from backend.app.llm.ollama import ModelUnavailable
+from backend.app.llm.provider import ModelClient, get_vlm_client_and_model
+from backend.app.llm.structured import (
     PageExtraction,
     VlmExtractionTranscription,
     generate_structured,

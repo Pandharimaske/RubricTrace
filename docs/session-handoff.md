@@ -313,9 +313,9 @@ Do not run `npm run dev` from the repository root because `package.json` lives u
 - Database schema/migrations: `backend/app/db/database.py`
 - Exam persistence: `backend/app/db/exams.py`
 - Pydantic schemas: `backend/app/models/schemas.py`
-- Extraction orchestration: `backend/app/services/assessment/extraction/process.py`
-- VLM extraction pipeline: `backend/app/services/assessment/extraction/pipeline.py`
-- Evaluation pipeline: `backend/app/services/assessment/jobs/pipeline.py`
+- Extraction orchestration: `backend/app/extraction/process.py`
+- VLM extraction pipeline: `backend/app/extraction/pipeline.py`
+- Evaluation pipeline: `backend/app/grading/pipeline.py`
 - Frontend API client: `frontend/src/api.js`
 - Frontend exam editor: `frontend/src/components/RubricEditor.jsx`
 - Frontend exam authoring page: `frontend/src/pages/exam/ExamRubric.jsx`

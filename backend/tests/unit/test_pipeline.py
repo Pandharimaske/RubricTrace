@@ -3,13 +3,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pymupdf
+from backend.app.extraction.segment import segment_questions
+from backend.app.grading.pipeline import evaluate_teacher_config, run_pipeline
 from backend.app.models.schemas import (
     GradingCriterion,
     QuestionGradingConfig,
     TeacherEvaluationRequest,
 )
-from backend.app.services.assessment.extraction.segment import segment_questions
-from backend.app.services.assessment.jobs.pipeline import evaluate_teacher_config, run_pipeline
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,7 +44,7 @@ def _llm_full_marks(**kwargs):
     )
 
 
-@patch("backend.app.services.assessment.jobs.pipeline.llm_grade", side_effect=_llm_full_marks)
+@patch("backend.app.grading.pipeline.llm_grade", side_effect=_llm_full_marks)
 def test_demo_pipeline_scores_records(_mock_llm, tmp_path: Path) -> None:
     output_path = tmp_path / "results.json"
     payload = run_pipeline(
@@ -85,8 +85,8 @@ def test_empty_extracted_answer_needs_review(tmp_path: Path) -> None:
     assert payload["results"][0]["llm_model"] is None
 
 
-@patch("backend.app.services.assessment.jobs.pipeline.extract_script_questions")
-@patch("backend.app.services.assessment.jobs.pipeline.llm_grade", side_effect=_llm_full_marks)
+@patch("backend.app.grading.pipeline.extract_script_questions")
+@patch("backend.app.grading.pipeline.llm_grade", side_effect=_llm_full_marks)
 def test_teacher_evaluation_saves_question_results(mock_llm, mock_extract, tmp_path: Path) -> None:
     script_path = tmp_path / "student.pdf"
     document = pymupdf.open()

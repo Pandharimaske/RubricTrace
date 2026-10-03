@@ -50,8 +50,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.app.core.settings import PROCESSED_DIR
 from backend.app.db.database import DEFAULT_REVIEW_THRESHOLD, clamp_review_threshold, review_verdict
-from backend.app.services.assessment.grading.grader import llm_grade_mcq
-from backend.app.services.assessment.llm.ollama import ModelUnavailable, OllamaClient
+from backend.app.grading.grader import llm_grade_mcq
+from backend.app.llm.ollama import ModelUnavailable, OllamaClient
 
 DEFAULT_MODEL = "qwen2.5:3b"
 

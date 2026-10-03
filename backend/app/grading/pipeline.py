@@ -25,13 +25,13 @@ from backend.app.db.database import (
     upsert_evaluation,
     upsert_student,
 )
+from backend.app.extraction.questions import extract_script_questions
+from backend.app.extraction.segment import normalize_question_id
+from backend.app.grading.dataset import DatasetRecord, load_dataset
+from backend.app.grading.grader import llm_grade
+from backend.app.grading.repository import save_evaluation
+from backend.app.llm.ollama import ModelUnavailable
 from backend.app.models.schemas import TeacherEvaluationRequest
-from backend.app.services.assessment.extraction.questions import extract_script_questions
-from backend.app.services.assessment.extraction.segment import normalize_question_id
-from backend.app.services.assessment.grading.grader import llm_grade
-from backend.app.services.assessment.jobs.dataset import DatasetRecord, load_dataset
-from backend.app.services.assessment.jobs.repository import save_evaluation
-from backend.app.services.assessment.llm.ollama import ModelUnavailable
 
 
 def _flag_reasons(

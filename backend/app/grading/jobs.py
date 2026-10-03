@@ -25,9 +25,9 @@ from backend.app.db.exams import (
     is_cancel_requested,
     update_job,
 )
-from backend.app.services.assessment.extraction.process import process_script_file
-from backend.app.services.assessment.jobs.pipeline import _grade_one_question, _lookup_answer
-from backend.app.services.assessment.llm.ollama import ModelUnavailable
+from backend.app.extraction.process import process_script_file
+from backend.app.grading.pipeline import _grade_one_question, _lookup_answer
+from backend.app.llm.ollama import ModelUnavailable
 
 log = logging.getLogger(__name__)
 

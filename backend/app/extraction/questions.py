@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.app.services.assessment.extraction.pdf import pdf_to_images
-from backend.app.services.assessment.extraction.pipeline import vlm_extract_questions
-from backend.app.services.assessment.extraction.segment import (
+from backend.app.extraction.pdf import pdf_to_images
+from backend.app.extraction.pipeline import vlm_extract_questions
+from backend.app.extraction.segment import (
     normalize_question_id,
     segment_questions,
 )

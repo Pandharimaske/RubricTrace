@@ -72,7 +72,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from backend.app.services.assessment.extraction.merge import normalize_qid
+from backend.app.extraction.merge import normalize_qid
 
 _NUMBERED_ITEM = re.compile(r"(?im)^\s*\*{0,2}(?:question\s*)?(\d{1,3})\s*[.):]")
 

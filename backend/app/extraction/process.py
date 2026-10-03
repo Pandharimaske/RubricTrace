@@ -14,7 +14,7 @@ from backend.app.db.database import (
     upsert_question_extraction,
 )
 from backend.app.db.exams import get_exam
-from backend.app.services.assessment.extraction.questions import extract_script_questions
+from backend.app.extraction.questions import extract_script_questions
 
 # Used only for scripts that don't belong to an exam (no answer key to say how many).
 DEFAULT_QUESTION_IDS = [f"Q{i}" for i in range(1, 36)]

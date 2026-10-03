@@ -7,6 +7,7 @@ import io
 import re
 
 from backend.app.core.settings import UPLOAD_DIR
+from backend.app.core.storage import delete_upload
 from backend.app.db.database import get_db
 from backend.app.db.exams import (
     active_job,
@@ -22,15 +23,14 @@ from backend.app.db.exams import (
     request_cancel,
     update_exam,
 )
-from backend.app.models.schemas import EvaluatorConfigCreate, ExamCreate, ExamUpdate, GradeRequest
-from backend.app.services.assessment.jobs.exam_jobs import (
+from backend.app.grading.jobs import (
     JobConflict,
     NothingToDo,
     SetupRequired,
     start_grade_job,
     start_process_job,
 )
-from backend.app.services.storage import delete_upload
+from backend.app.models.schemas import EvaluatorConfigCreate, ExamCreate, ExamUpdate, GradeRequest
 from fastapi import APIRouter, HTTPException, Response
 
 router = APIRouter(prefix="/exams", tags=["exams"])

@@ -4,6 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from backend.app.core.settings import PAGE_IMAGE_DIR, UPLOAD_DIR
+from backend.app.core.storage import delete_upload, save_upload
 from backend.app.db.database import (
     get_db,
     get_evaluations_for_script,
@@ -17,9 +18,8 @@ from backend.app.db.database import (
     upsert_student,
 )
 from backend.app.db.exams import get_exam
-from backend.app.services.assessment.extraction.process import process_script_file
-from backend.app.services.assessment.llm.ollama import ModelUnavailable
-from backend.app.services.storage import delete_upload, save_upload
+from backend.app.extraction.process import process_script_file
+from backend.app.llm.ollama import ModelUnavailable
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
