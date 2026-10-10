@@ -8,7 +8,6 @@ README commands invoke them by stable paths.
 - `run_api.sh`: start the FastAPI backend.
 - `run_ui.sh`: start the Vite frontend.
 - `run_all.sh`: start backend and frontend together.
-- `run_models.sh`: start local model services.
 - `check_setup.py`: check local development prerequisites.
 
 ## Data preparation
@@ -21,8 +20,8 @@ README commands invoke them by stable paths.
 
 ## Grading and evaluation
 
-- `grade_mcq_local.py`: grade objective answers with the local model.
-- `grade_short_answer_cloud.py`: grade short answers with a configured cloud model.
+- `grade_mcq.py`: grade objective answers with an NVIDIA-hosted model.
+- `grade_short_answer_cloud.py`: grade short answers with an NVIDIA-hosted model.
 - `run_grading_parallel.sh`: run both grading tracks and merge their output.
 - `merge_grading_results.py`: combine grading tracks.
 - `compute_grading_metrics.py`: calculate evaluation metrics.

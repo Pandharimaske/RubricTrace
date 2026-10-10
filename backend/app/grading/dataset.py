@@ -48,20 +48,31 @@ def _parse_record(raw: dict[str, Any], metadata_path: Path) -> DatasetRecord:
     )
 
 
-def load_dataset(metadata_path: Path) -> list[DatasetRecord]:
-    metadata_path = metadata_path.expanduser().resolve()
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Dataset metadata not found: {metadata_path}")
+class DatasetLoader:
+    """Loads and validates evaluation datasets from CSV or JSON files."""
 
-    if metadata_path.suffix.lower() == ".csv":
-        with metadata_path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
-    elif metadata_path.suffix.lower() == ".json":
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        rows = payload["records"] if isinstance(payload, dict) else payload
-    else:
-        raise ValueError("Dataset metadata must be CSV or JSON")
+    @staticmethod
+    def resolve_script_path(metadata_path: Path, raw_path: str) -> Path:
+        return _resolve_script_path(metadata_path, raw_path)
 
-    if not rows:
-        raise ValueError("Dataset metadata contains no records")
-    return [_parse_record(row, metadata_path) for row in rows]
+    @staticmethod
+    def parse_record(raw: dict[str, Any], metadata_path: Path) -> DatasetRecord:
+        return _parse_record(raw, metadata_path)
+
+    def load(self, metadata_path: Path) -> list[DatasetRecord]:
+        metadata_path = metadata_path.expanduser().resolve()
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Dataset metadata not found: {metadata_path}")
+
+        if metadata_path.suffix.lower() == ".csv":
+            with metadata_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+        elif metadata_path.suffix.lower() == ".json":
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            rows = payload["records"] if isinstance(payload, dict) else payload
+        else:
+            raise ValueError("Dataset metadata must be CSV or JSON")
+
+        if not rows:
+            raise ValueError("Dataset metadata contains no records")
+        return [self.parse_record(row, metadata_path) for row in rows]

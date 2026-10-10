@@ -25,8 +25,9 @@ from pathlib import Path
 # the project root here so this also works as a plain `python scripts/...`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PAGE_IMAGE_DIR, ensure_data_dirs
-from backend.app.db.database import get_db, update_script_status
+from backend.app.core.config import PAGE_IMAGE_DIR, ensure_data_dirs
+from backend.app.db.database import default_database
+from backend.app.db.repositories import ScriptRepository
 from backend.app.extraction.pdf import pdf_to_images
 
 
@@ -40,8 +41,9 @@ def main() -> None:
     args = parser.parse_args()
 
     ensure_data_dirs()
+    scripts = ScriptRepository(default_database)
 
-    with get_db() as conn:
+    with default_database.connection() as conn:
         rows = [
             dict(r)
             for r in conn.execute(
@@ -76,7 +78,7 @@ def main() -> None:
             continue
 
         # Preserve whatever status this row already had; only fill in page_count.
-        update_script_status(script_id, row["status"] or "processed", page_count=len(images))
+        scripts.set_status(script_id, row["status"] or "processed", page_count=len(images))
         rendered += 1
         print(f"  OK   {script_id}: {len(images)} pages")
 

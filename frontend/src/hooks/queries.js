@@ -136,10 +136,10 @@ export function useExamJob(examId) {
     const active = isJobActive(job)
     if (active || wasActive.current) {
       qc.invalidateQueries({ queryKey: keys.exam(examId) })
+      qc.invalidateQueries({ queryKey: keys.reviewQueue })
     }
     if (wasActive.current && !active) {
       qc.invalidateQueries({ queryKey: keys.stats })
-      qc.invalidateQueries({ queryKey: keys.reviewQueue })
     }
     wasActive.current = active
   }, [job?.done, job?.status]) // eslint-disable-line react-hooks/exhaustive-deps

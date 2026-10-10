@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Grade every short-answer record with a cloud LLM (NVIDIA NIM or Groq) via the
+Grade every short-answer record with NVIDIA NIM via the
 full-reasoning llm_grade() path — partial credit, rubric-criterion breakdown,
 reasoning/evidence trace, confidence, needs_review.
 
-Designed to run standalone and CONCURRENTLY with grade_mcq_local.py (see
-run_grading_parallel.sh): this script only talks to the cloud API, the other
-only talks to localhost:11434, so neither blocks the other and each can be
-tuned independently (this one via --concurrency, since cloud APIs can serve
-several requests in flight; the local one stays sequential since a single
-Ollama server usually can't).
+Designed to run standalone and CONCURRENTLY with grade_mcq.py (see
+run_grading_parallel.sh): the two write to separate output files and share no state.
+This one can serve several requests in flight (--concurrency); grade_mcq.py stays
+sequential.
 
 Marks are constrained to the assignment's discrete half-mark scale
 {0, 0.5, 1, 1.5, 2}: the model is instructed to use only those values, and the
@@ -37,43 +35,12 @@ Output
               data/processed/results_short_answer.json. Re-running resumes:
               any (student_id, question_id) already present is skipped.
 
-Provider + automatic credit/quota failover
--------------------------------------------
---provider    A comma-separated provider chain, tried in order: e.g. "nvidia"
-              (single, no failover), "groq", or "nvidia,groq" (default) — start
-              on NVIDIA, fail over to Groq if NVIDIA's credits/quota run out
-              mid-run. Independent of the app-wide RUBRICTRACE_MODEL_PROVIDER —
-              this always uses cloud backend(s) regardless of what that's set
-              to, so it can run alongside the local MCQ track. Requires
-              NVIDIA_API_KEY and/or GROQ_API_KEY in .env for whichever
-              provider(s) are in the chain.
-
-              Both providers are pointed at the SAME model by default
-              (openai/gpt-oss-20b — chosen specifically because it's hosted on
-              both NVIDIA's and Groq's catalogs, unlike most other models), via
-              RUBRICTRACE_NVIDIA_LLM_MODEL / RUBRICTRACE_GROQ_LLM_MODEL in
-              .env. That's what makes the failover meaningful rather than just
-              a crash-avoidance mechanism: grading quality/character doesn't
-              shift mid-run just because the API backend did. --model
-              overrides the model for every provider in the chain uniformly
-              (there's no way to give each provider a different model from the
-              CLI — set the per-provider env vars directly for that).
-
-              Detection: a request that fails with a quota/credit/rate-limit
-              marker in the error text (429, "quota", "credit", "billing",
-              "rate limit"/"rate_limit") switches the WHOLE run to the next
-              provider in the chain from that point on (not just a one-off
-              retry) — the assumption is that if the account is out of
-              credits, the very next call will fail the same way, so retrying
-              the same dead provider per-record would just waste every
-              remaining record's worth of generate_structured() retries. Any
-              other failure (timeout, malformed JSON, transient network
-              error) is NOT treated as exhaustion — those already get retried
-              in place by generate_structured() first, on the same provider,
-              since they're likely transient rather than a dead account. If
-              every provider in the chain is exhausted, the record falls back
-              to the normal 0-marks/needs_review path like any other grading
-              failure.
+Provider
+--------
+--provider    NVIDIA is the only supported cloud provider. This script requires
+              NVIDIA_API_KEY in .env. The model defaults to
+              RUBRICTRACE_NVIDIA_LLM_MODEL (openai/gpt-oss-20b); use --model to
+              override it for this run.
 
 Edge cases handled explicitly (see inline comments):
   - blank/whitespace extracted answer -> scored 0, NOT flagged for review, no
@@ -86,8 +53,6 @@ Edge cases handled explicitly (see inline comments):
     scored 0, needs_review, review_reason carries the error, run continues
   - awarded_marks is snapped to the nearest half-mark and clipped to
     [0, max_marks] regardless of what the model returns
-  - provider exhaustion (see above) -> whole run fails over to the next
-    provider in --provider's chain, once, not per-record
 """
 
 from __future__ import annotations
@@ -104,21 +69,15 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PROCESSED_DIR
-from backend.app.db.database import DEFAULT_REVIEW_THRESHOLD, clamp_review_threshold, review_verdict
-from backend.app.grading.grader import llm_grade
-from backend.app.llm.ollama import ModelUnavailable
+from _legacy import DEFAULT_REVIEW_THRESHOLD, clamp_review_threshold, llm_grade, review_verdict
+from backend.app.core.config import PROCESSED_DIR, settings
+from backend.app.llm.errors import ModelUnavailable
 
 DEFAULT_CONCURRENCY = 4
-DEFAULT_PROVIDER_CHAIN = "nvidia,groq"
+DEFAULT_PROVIDER_CHAIN = "nvidia"
 
-# Substrings (checked case-insensitively against the stringified exception) that
-# indicate the PROVIDER account is exhausted (out of credits, over its rate
-# limit/quota) rather than a one-off transient failure. Deliberately broad
-# across both OpenAI-style ("insufficient_quota", "Error code: 429") and
-# Groq-style ("rate_limit_exceeded") error text, since both NvidiaClient and
-# GroqClient wrap the underlying openai-sdk exception into
-# f"... request failed for {model}: {exc}" without normalizing its shape.
+# Substrings that identify an exhausted NVIDIA account rather than a transient
+# failure. The script records those failures for review and continues the run.
 _EXHAUSTION_MARKERS = (
     "insufficient_quota",
     "quota",
@@ -164,21 +123,14 @@ def _make_single_client(provider: str, model_override: str | None) -> tuple[Any,
     if provider == "nvidia":
         from backend.app.llm.nvidia import NvidiaClient
 
-        model = model_override or os.getenv("RUBRICTRACE_NVIDIA_LLM_MODEL", "openai/gpt-oss-20b")
+        model = model_override or settings.nvidia_llm_model
         return NvidiaClient(), model
-    if provider == "groq":
-        from backend.app.llm.groq import GroqClient
-
-        model = model_override or os.getenv("RUBRICTRACE_GROQ_LLM_MODEL", "openai/gpt-oss-20b")
-        return GroqClient(), model
-    raise SystemExit(
-        f"Unknown provider {provider!r} in --provider: expected 'nvidia' and/or 'groq'."
-    )
+    raise SystemExit(f"Unknown provider {provider!r}; only 'nvidia' is supported.")
 
 
 class _FallbackClient:
     """
-    Wraps an ordered chain of cloud clients (e.g. NVIDIA then Groq) serving the
+    Wraps an ordered chain of cloud clients serving the
     SAME model, and permanently switches the whole run from the active one to
     the next the first time a call fails with a credit/quota/rate-limit
     marker (see _EXHAUSTION_MARKERS) — see the module docstring's "Provider +
@@ -264,8 +216,7 @@ def _build_client(provider_arg: str, model_override: str | None) -> tuple[Any, s
         print(
             f"WARNING: providers in the fallback chain are pointed at different models "
             f"({built[0][0]}={model!r}, {mismatched}) — a mid-run failover will change "
-            "which model grades the rest of the run. Set RUBRICTRACE_NVIDIA_LLM_MODEL and "
-            "RUBRICTRACE_GROQ_LLM_MODEL to the same value in .env to avoid this.",
+            "which model grades the rest of the run.",
             flush=True,
         )
 

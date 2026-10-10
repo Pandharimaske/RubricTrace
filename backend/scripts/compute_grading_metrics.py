@@ -63,17 +63,14 @@ try:
     from scipy.stats import pearsonr, spearmanr
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        "This script requires scipy (already a scikit-learn dependency in "
-        "requirements.txt). If it's somehow missing: "
-        "pip install scipy --break-system-packages"
+        "This script needs scipy. Install the evaluation dependencies: uv sync --group eval"
     ) from exc
 
 try:
     from sklearn.metrics import cohen_kappa_score
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        "This script requires scikit-learn (already in requirements.txt). "
-        "If it's somehow missing: pip install scikit-learn --break-system-packages"
+        "This script needs scikit-learn. Install the evaluation dependencies: uv sync --group eval"
     ) from exc
 
 

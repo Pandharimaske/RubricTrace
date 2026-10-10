@@ -22,7 +22,10 @@ batch run without digging through per-page debug output.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -46,25 +49,27 @@ class ExtractionMetrics:
     illegible_items: int = 0
 
     def log_summary(self) -> None:
-        print(
-            "    [metrics] pages: "
-            f"{self.pages_total} total, {self.pages_blank_skipped} blank-skipped, "
-            f"{self.pages_no_content} no-content, {self.pages_cached} from cache",
-            flush=True,
+        log.info(
+            "metrics pages: %d total, %d blank-skipped, %d no-content, %d from cache",
+            self.pages_total,
+            self.pages_blank_skipped,
+            self.pages_no_content,
+            self.pages_cached,
         )
-        print(
-            "    [metrics] prompt-quality signals (expect -> 0 as prompts improve): "
-            f"completeness retries {self.completeness_retries_triggered} "
-            f"({self.completeness_retries_recovered} recovered), "
-            f"suspect-duplicate groups {self.suspect_duplicate_groups} "
-            f"({self.suspect_duplicate_items} items), "
-            f"never-mentioned IDs {self.never_mentioned_items}",
-            flush=True,
+        log.info(
+            "metrics prompt-quality signals (expect -> 0 as prompts improve): completeness "
+            "retries %d (%d recovered), suspect-duplicate groups %d (%d items), "
+            "never-mentioned IDs %d",
+            self.completeness_retries_triggered,
+            self.completeness_retries_recovered,
+            self.suspect_duplicate_groups,
+            self.suspect_duplicate_items,
+            self.never_mentioned_items,
         )
-        print(
-            "    [metrics] structural signals (persist regardless of prompt quality): "
-            f"unassigned items {self.unassigned_items}, "
-            f"digit-conflict items {self.digit_conflict_items}, "
-            f"illegible items {self.illegible_items}",
-            flush=True,
+        log.info(
+            "metrics structural signals (persist regardless of prompt quality): unassigned "
+            "items %d, digit-conflict items %d, illegible items %d",
+            self.unassigned_items,
+            self.digit_conflict_items,
+            self.illegible_items,
         )

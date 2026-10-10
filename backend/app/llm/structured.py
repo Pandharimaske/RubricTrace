@@ -2,7 +2,7 @@
 Pydantic schemas for validating raw LLM/VLM JSON output, plus a validate-and-retry
 wrapper around ModelClient.generate().
 
-Why this exists: parse_json_response() (in ollama.py) only guarantees the response
+Why this exists: parse_json_response() (in parsing.py) only guarantees the response
 is *some* JSON object — it says nothing about whether the right keys/types are
 present. Cloud NIM models in particular will happily return syntactically valid
 JSON that's missing a field, has the wrong type, or wraps things differently than
@@ -13,14 +13,18 @@ with a KeyError or a silently wrong type.
 
 from __future__ import annotations
 
-import os
+import logging
 import time
 from pathlib import Path
 from typing import Any, Literal
 
-from backend.app.llm.ollama import ModelUnavailable, parse_json_response
+from backend.app.core.config import settings
+from backend.app.llm.errors import ModelUnavailable
+from backend.app.llm.parsing import parse_json_response
 from backend.app.llm.provider import ModelClient
 from pydantic import BaseModel, Field, ValidationError, field_validator
+
+log = logging.getLogger(__name__)
 
 # ---- Output schemas -------------------------------------------------------
 
@@ -91,13 +95,6 @@ class PageExtraction(BaseModel):
     @classmethod
     def _unassigned_to_list(cls, value: Any) -> Any:
         return [] if value is None else value
-
-
-class VlmExtractionTranscription(BaseModel):
-    """Shape returned by the per-question extraction transcription prompt."""
-
-    question_id: str
-    answer: str = ""
 
 
 class GraderOutput(BaseModel):
@@ -176,7 +173,7 @@ def generate_structured(
     max_retries defaults to RUBRICTRACE_STRUCTURED_MAX_RETRIES (env var) or 2.
     """
     if max_retries is None:
-        max_retries = int(os.getenv("RUBRICTRACE_STRUCTURED_MAX_RETRIES", "2"))
+        max_retries = settings.structured_max_retries
     last_error: Exception | None = None
     current_prompt = prompt
 
@@ -187,10 +184,12 @@ def generate_structured(
             last_error = exc
             if attempt < max_retries:
                 wait = min(2**attempt, 5)
-                print(
-                    f"    [structured] {model} attempt {attempt + 1} request failed "
-                    f"({exc}), retrying in {wait}s…",
-                    flush=True,
+                log.warning(
+                    "%s attempt %d request failed (%s), retrying in %ds",
+                    model,
+                    attempt + 1,
+                    exc,
+                    wait,
                 )
                 time.sleep(wait)
             continue
@@ -200,10 +199,11 @@ def generate_structured(
         except ModelUnavailable as exc:
             last_error = exc
             if attempt < max_retries:
-                print(
-                    f"    [structured] {model} attempt {attempt + 1} failed schema "
-                    f"validation, retrying: {exc}",
-                    flush=True,
+                log.warning(
+                    "%s attempt %d failed schema validation, retrying: %s",
+                    model,
+                    attempt + 1,
+                    exc,
                 )
             current_prompt = (
                 prompt + f"\n\nYour previous response was invalid: {exc}\n"

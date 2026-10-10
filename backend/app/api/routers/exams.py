@@ -1,99 +1,73 @@
-"""Exam bounded-context endpoints: authoring, scripts, grading jobs, and results."""
+"""Exam endpoints: authoring, scripts, grading jobs, and results."""
 
 from __future__ import annotations
 
 import csv
 import io
 import re
+from collections.abc import Callable
+from typing import Any
 
-from backend.app.core.settings import UPLOAD_DIR
-from backend.app.core.storage import delete_upload
-from backend.app.db.database import get_db
-from backend.app.db.exams import (
-    active_job,
-    create_evaluator_config,
-    create_exam,
-    delete_exam,
-    exam_results,
-    exam_scripts,
-    get_exam,
-    latest_job,
-    list_evaluator_configs,
-    list_exams,
-    request_cancel,
-    update_exam,
-)
-from backend.app.grading.jobs import (
-    JobConflict,
-    NothingToDo,
-    SetupRequired,
-    start_grade_job,
-    start_process_job,
-)
+from backend.app.api.deps import ContainerDep
+from backend.app.container import Container
+from backend.app.grading.jobs import JobConflict, NothingToDo, SetupRequired
 from backend.app.models.schemas import EvaluatorConfigCreate, ExamCreate, ExamUpdate, GradeRequest
 from fastapi import APIRouter, HTTPException, Response
 
 router = APIRouter(prefix="/exams", tags=["exams"])
 
 
-def _require_exam(conn, exam_id: str) -> dict:
-    exam = get_exam(conn, exam_id)
+def _require_exam(c: Container, exam_id: str) -> dict[str, Any]:
+    exam = c.exams.get(exam_id)
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
     return exam
 
 
 @router.get("")
-def list_all_exams() -> dict[str, object]:
-    with get_db() as conn:
-        return {"exams": list_exams(conn)}
+def list_all_exams(c: ContainerDep) -> dict[str, object]:
+    return {"exams": c.exams.list_all()}
 
 
 @router.post("")
-def create_new_exam(body: ExamCreate) -> dict[str, object]:
-    return create_exam(body.name)
+def create_new_exam(body: ExamCreate, c: ContainerDep) -> dict[str, object]:
+    return c.exams.create(body.name)
 
 
 @router.get("/evaluator-configs")
-def list_exam_evaluator_configs() -> dict[str, object]:
-    with get_db() as conn:
-        return {"evaluator_configs": list_evaluator_configs(conn)}
+def list_exam_evaluator_configs(c: ContainerDep) -> dict[str, object]:
+    return {"evaluator_configs": c.evaluator_configs.list_all()}
 
 
 @router.post("/evaluator-configs")
-def create_exam_evaluator_config(body: EvaluatorConfigCreate) -> dict[str, object]:
-    return create_evaluator_config(body.model_dump())
+def create_exam_evaluator_config(body: EvaluatorConfigCreate, c: ContainerDep) -> dict[str, object]:
+    return c.evaluator_configs.create(body.model_dump())
 
 
 @router.get("/{exam_id}")
-def get_exam_detail(exam_id: str) -> dict[str, object]:
-    with get_db() as conn:
-        return _require_exam(conn, exam_id)
+def get_exam_detail(exam_id: str, c: ContainerDep) -> dict[str, object]:
+    return _require_exam(c, exam_id)
 
 
 @router.delete("/{exam_id}")
-def delete_exam_endpoint(exam_id: str) -> dict[str, str]:
-    with get_db() as conn:
-        _require_exam(conn, exam_id)
-        if active_job(conn, exam_id):
-            raise HTTPException(
-                status_code=409,
-                detail="A job is still running for this exam. Cancel it before deleting.",
-            )
+def delete_exam_endpoint(exam_id: str, c: ContainerDep) -> dict[str, str]:
+    _require_exam(c, exam_id)
+    if c.job_records.active(exam_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A job is still running for this exam. Cancel it before deleting.",
+        )
 
-    script_ids = delete_exam(exam_id)
+    script_ids = c.exams.delete(exam_id)
     if script_ids is None:
         raise HTTPException(status_code=404, detail="Exam not found")
-
     for script_id in script_ids:
-        for leftover in UPLOAD_DIR.glob(f"{script_id}.*"):
-            delete_upload(script_id, leftover)
-
+        c.storage.delete(script_id)
     return {"deleted": exam_id}
 
 
 @router.put("/{exam_id}")
-def update_exam_detail(exam_id: str, body: ExamUpdate) -> dict[str, object]:
+def update_exam_detail(exam_id: str, body: ExamUpdate, c: ContainerDep) -> dict[str, object]:
     questions = None
     if body.questions is not None:
         questions = []
@@ -101,7 +75,7 @@ def update_exam_detail(exam_id: str, body: ExamUpdate) -> dict[str, object]:
             item = q.model_dump()
             item["question_id"] = item["question_id"].strip()
             questions.append(item)
-    exam = update_exam(
+    exam = c.exams.update(
         exam_id,
         name=body.name,
         questions=questions,
@@ -113,16 +87,14 @@ def update_exam_detail(exam_id: str, body: ExamUpdate) -> dict[str, object]:
 
 
 @router.get("/{exam_id}/scripts")
-def list_exam_scripts(exam_id: str) -> dict[str, object]:
-    with get_db() as conn:
-        _require_exam(conn, exam_id)
-        return {"scripts": exam_scripts(conn, exam_id)}
+def list_exam_scripts(exam_id: str, c: ContainerDep) -> dict[str, object]:
+    _require_exam(c, exam_id)
+    return {"scripts": c.exams.scripts(exam_id)}
 
 
 @router.get("/{exam_id}/results")
-def get_exam_results(exam_id: str) -> dict[str, object]:
-    with get_db() as conn:
-        return exam_results(conn, _require_exam(conn, exam_id))
+def get_exam_results(exam_id: str, c: ContainerDep) -> dict[str, object]:
+    return c.exams.results(_require_exam(c, exam_id))
 
 
 def _csv_safe(value: object) -> object:
@@ -132,10 +104,9 @@ def _csv_safe(value: object) -> object:
 
 
 @router.get("/{exam_id}/export.csv")
-def export_results(exam_id: str) -> Response:
-    with get_db() as conn:
-        exam = _require_exam(conn, exam_id)
-        results = exam_results(conn, exam)
+def export_results(exam_id: str, c: ContainerDep) -> Response:
+    exam = _require_exam(c, exam_id)
+    results = c.exams.results(exam)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -166,7 +137,7 @@ def export_results(exam_id: str) -> Response:
 # ── Jobs ─────────────────────────────────────────────────────────────────────
 
 
-def _start(starter, *args) -> dict[str, object]:
+def _start(starter: Callable[..., dict[str, Any]], *args: object) -> dict[str, object]:
     try:
         return {"job": starter(*args)}
     except LookupError as exc:
@@ -178,24 +149,25 @@ def _start(starter, *args) -> dict[str, object]:
 
 
 @router.post("/{exam_id}/process")
-def process_exam_scripts(exam_id: str) -> dict[str, object]:
+def process_exam_scripts(exam_id: str, c: ContainerDep) -> dict[str, object]:
     """Segment and transcribe every uploaded script that hasn't been processed yet."""
-    return _start(start_process_job, exam_id)
+    return _start(c.jobs.start_process, exam_id)
 
 
 @router.post("/{exam_id}/grade")
-def grade_exam(exam_id: str, body: GradeRequest | None = None) -> dict[str, object]:
+def grade_exam(
+    exam_id: str, c: ContainerDep, body: GradeRequest | None = None
+) -> dict[str, object]:
     """Grade every student's answers against the exam's answer key."""
-    return _start(start_grade_job, exam_id, (body or GradeRequest()).regrade)
+    return _start(c.jobs.start_grade, exam_id, (body or GradeRequest()).regrade)
 
 
 @router.get("/{exam_id}/job")
-def get_latest_job(exam_id: str) -> dict[str, object]:
-    with get_db() as conn:
-        _require_exam(conn, exam_id)
-        return {"job": latest_job(conn, exam_id)}
+def get_latest_job(exam_id: str, c: ContainerDep) -> dict[str, object]:
+    _require_exam(c, exam_id)
+    return {"job": c.job_records.latest(exam_id)}
 
 
 @router.post("/{exam_id}/job/cancel")
-def cancel_job(exam_id: str) -> dict[str, object]:
-    return {"cancelling": request_cancel(exam_id)}
+def cancel_job(exam_id: str, c: ContainerDep) -> dict[str, object]:
+    return {"cancelling": c.job_records.request_cancel(exam_id)}

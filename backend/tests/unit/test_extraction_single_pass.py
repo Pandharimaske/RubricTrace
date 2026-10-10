@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from backend.app.extraction.pipeline import vlm_extract_questions
+from backend.app.core.config import Settings, settings
+from backend.app.extraction.pipeline import ExtractionOutcome, ScriptExtractor
 from backend.app.llm.structured import PageExtraction
 from PIL import Image, ImageDraw
 
@@ -47,9 +48,17 @@ def _answer(qid: str, text: str, **extra: Any) -> dict[str, Any]:
     return {"question_id": qid, "status": "answered", "answer": text, "confidence": 0.9, **extra}
 
 
+def _extract(
+    pages: list[Path],
+    client: FakeClient,
+    question_types: dict[str, str] | None = None,
+) -> ExtractionOutcome:
+    return ScriptExtractor(vlm_client=client).extract_pages(pages, QUESTION_IDS, question_types)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("RUBRICTRACE_EXTRACTION_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(settings, "extraction_cache_dir", tmp_path / "cache")
 
 
 def test_one_call_per_page_and_continuation_is_appended(tmp_path: Path) -> None:
@@ -70,30 +79,41 @@ def test_one_call_per_page_and_continuation_is_appended(tmp_path: Path) -> None:
         ]
     )
 
-    questions, question_pages, model, conflicts, confidences = vlm_extract_questions(
-        pages, QUESTION_IDS, client=client, question_types={"Q1": "mcq", "Q2": "short_answer"}
-    )
+    outcome = _extract(pages, client, {"Q1": "mcq", "Q2": "short_answer"})
 
     assert len(client.prompts) == 2  # one structured call per page, no second stage
-    assert questions == {"Q1": "A", "Q2": "first part\nmore of two", "Q3": "C"}
-    assert question_pages == {"Q1": 1, "Q2": 1, "Q3": 2}
-    assert conflicts == []
-    assert confidences["Q2"] == 0.9
-    assert model.startswith("vlm:")
+    assert outcome.questions == {"Q1": "A", "Q2": "first part\nmore of two", "Q3": "C"}
+    assert outcome.question_pages == {"Q1": 1, "Q2": 1, "Q3": 2}
+    assert outcome.conflicts == []
+    assert outcome.question_confidences["Q2"] == 0.9
+    assert outcome.model.startswith("vlm:")
     assert "Q1 (mcq)" in client.prompts[0]
     assert "previous page's last answer was for Q2" in client.prompts[1]
 
 
 def test_second_run_is_served_from_cache(tmp_path: Path) -> None:
     pages = [_page(tmp_path / "p1.png", 0)]
-    first = FakeClient([{"raw_text": "1. B", "answers": [_answer("Q1", "B")]}])
-    vlm_extract_questions(pages, QUESTION_IDS, client=first)
+    _extract(pages, FakeClient([{"raw_text": "1. B", "answers": [_answer("Q1", "B")]}]))
 
     second = FakeClient([])  # would raise IndexError if the model were called
-    questions, *_ = vlm_extract_questions(pages, QUESTION_IDS, client=second)
+    outcome = _extract(pages, second)
 
     assert second.prompts == []
-    assert questions["Q1"] == "B"
+    assert outcome.questions["Q1"] == "B"
+
+
+def test_script_extractor_uses_the_injected_client_and_model(tmp_path: Path) -> None:
+    page = _page(tmp_path / "p1.png", 0)
+    client = FakeClient([{"raw_text": "1. A", "answers": [_answer("Q1", "A")]}])
+
+    outcome = ScriptExtractor(
+        vlm_client=client,
+        config=Settings(nvidia_vlm_model="test-vlm", extraction_cache=False, _env_file=None),
+    ).extract_pages([page], QUESTION_IDS)
+
+    assert outcome.questions["Q1"] == "A"
+    assert outcome.model == "vlm:test-vlm"
+    assert client.prompts
 
 
 def test_illegible_answer_is_flagged_and_confidence_capped(tmp_path: Path) -> None:
@@ -114,13 +134,12 @@ def test_illegible_answer_is_flagged_and_confidence_capped(tmp_path: Path) -> No
         ]
     )
 
-    questions, _, _, conflicts, confidences = vlm_extract_questions(
-        pages, QUESTION_IDS, client=client
-    )
+    outcome = _extract(pages, client)
 
-    assert questions["Q1"] == "maybe B"
-    assert confidences["Q1"] <= 0.3
-    assert [c["question_id"] for c in conflicts if c.get("kind") == "illegible"] == ["Q1"]
+    assert outcome.questions["Q1"] == "maybe B"
+    assert outcome.question_confidences["Q1"] <= 0.3
+    illegible = [c["question_id"] for c in outcome.conflicts if c.get("kind") == "illegible"]
+    assert illegible == ["Q1"]
 
 
 def test_completeness_retry_recovers_question_missing_from_answers(tmp_path: Path) -> None:
@@ -132,11 +151,12 @@ def test_completeness_retry_recovers_question_missing_from_answers(tmp_path: Pat
         ]
     )
 
-    questions, *_ = vlm_extract_questions(pages, QUESTION_IDS, client=client)
+    outcome = _extract(pages, client)
 
     assert len(client.prompts) == 2
     assert "Q2" in client.prompts[1]
-    assert questions == {"Q1": "A", "Q2": "B", "Q3": ""}  # Q3 never mentioned -> placeholder
+    # Q3 was never mentioned anywhere -> empty placeholder
+    assert outcome.questions == {"Q1": "A", "Q2": "B", "Q3": ""}
 
 
 def test_repeated_true_false_answers_are_not_flagged_as_fabrication(tmp_path: Path) -> None:
@@ -150,10 +170,10 @@ def test_repeated_true_false_answers_are_not_flagged_as_fabrication(tmp_path: Pa
         ]
     )
 
-    questions, _, _, conflicts, _ = vlm_extract_questions(pages, QUESTION_IDS, client=client)
+    outcome = _extract(pages, client)
 
-    assert questions == {"Q1": "True", "Q2": "True", "Q3": "True"}
-    assert conflicts == []
+    assert outcome.questions == {"Q1": "True", "Q2": "True", "Q3": "True"}
+    assert outcome.conflicts == []
 
 
 def test_model_returning_answers_as_mapping_is_accepted() -> None:

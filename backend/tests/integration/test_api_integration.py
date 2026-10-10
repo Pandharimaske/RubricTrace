@@ -6,6 +6,7 @@ import pytest
 import requests
 
 BASE_URL = "http://localhost:8000/api"
+TIMEOUT = 10
 
 
 def _is_server_up() -> bool:
@@ -23,7 +24,7 @@ server_available = pytest.mark.skipif(
 
 @server_available
 def test_health():
-    res = requests.get(f"{BASE_URL}/health")
+    res = requests.get(f"{BASE_URL}/health", timeout=TIMEOUT)
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "healthy"
@@ -31,7 +32,7 @@ def test_health():
 
 @server_available
 def test_stats():
-    res = requests.get(f"{BASE_URL}/stats")
+    res = requests.get(f"{BASE_URL}/stats", timeout=TIMEOUT)
     assert res.status_code == 200
     data = res.json()
     assert "total_students" in data
@@ -41,7 +42,7 @@ def test_stats():
 
 @server_available
 def test_review_queue():
-    res = requests.get(f"{BASE_URL}/review-queue")
+    res = requests.get(f"{BASE_URL}/review-queue", timeout=TIMEOUT)
     assert res.status_code == 200
     data = res.json()
     assert "total" in data
@@ -71,12 +72,12 @@ def test_rubric_configs_crud():
             ]
         },
     }
-    create_res = requests.post(f"{BASE_URL}/rubric-configs", json=cfg_payload)
+    create_res = requests.post(f"{BASE_URL}/rubric-configs", json=cfg_payload, timeout=TIMEOUT)
     assert create_res.status_code == 200
     config_id = create_res.json()["config_id"]
 
     # Read
-    get_res = requests.get(f"{BASE_URL}/rubric-configs/{config_id}")
+    get_res = requests.get(f"{BASE_URL}/rubric-configs/{config_id}", timeout=TIMEOUT)
     assert get_res.status_code == 200
     data = get_res.json()
     assert data["name"] == "Integration Test Rubric"

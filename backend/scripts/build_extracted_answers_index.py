@@ -89,7 +89,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PROCESSED_DIR, RAW_DIR
+from backend.app.core.config import PROCESSED_DIR, RAW_DIR
 
 DEFAULT_INPUT_DIR = RAW_DIR / "extracted_answers"
 DEFAULT_PATTERN = re.compile(r"^student(\d+)\.json$", re.IGNORECASE)

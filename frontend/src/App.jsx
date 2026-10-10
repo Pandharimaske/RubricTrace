@@ -142,10 +142,19 @@ function Sidebar() {
     <div className="sidebar">
       <div className="sidebar-header">
         <Link to={paths.dashboard} className="logo" onClick={guardNavigation}>
-          <div className="logo-mark">📐</div>
+          <svg className="logo-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+            <rect x="2.5" y="2.5" width="27" height="27" rx="6" stroke="currentColor" strokeWidth="1.6" />
+            <path
+              d="M9 16.5l4.5 4.5L23 11"
+              stroke="#e3b65b"
+              strokeWidth="2.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
           <div>
             <div className="logo-text">RubricTrace</div>
-            <span className="logo-sub">Teacher Grading AI</span>
+            <span className="logo-sub">Grading workspace</span>
           </div>
         </Link>
       </div>

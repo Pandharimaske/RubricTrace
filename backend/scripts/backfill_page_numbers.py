@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PROCESSED_DIR
+from backend.app.core.config import PROCESSED_DIR
 from backend.app.db.database import get_db
 
 

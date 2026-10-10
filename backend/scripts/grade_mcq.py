@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Grade every MCQ record with a local Ollama model (qwen2.5:3b by default) via
+Grade every MCQ record with an NVIDIA-hosted model (openai/gpt-oss-20b by default) via
 the lean llm_grade_mcq() path — correct/incorrect only, no reasoning chain.
 
 Designed to run standalone and CONCURRENTLY with grade_short_answer_cloud.py
-(see run_grading_parallel.sh): this script never touches the network beyond
-localhost:11434, so it has no rate limits to worry about and no reason to wait
-on the cloud track, or vice versa.
+(see run_grading_parallel.sh): the two write to separate output files and share no state.
+This script stays sequential (one request at a time) so it leaves most of the NVIDIA
+rate-limit budget to the short-answer track, which runs several requests in flight.
 
 Input
 -----
@@ -30,7 +30,9 @@ Output
              (student_id, question_id) already present is skipped.
 
 Edge cases handled explicitly (see inline comments):
-  - blank/whitespace extracted answer -> scored 0, needs_review, no LLM call
+  - blank/whitespace extracted answer -> scored 0, NOT flagged for review, no
+    LLM call (a skipped question is the expected case, not an extraction failure;
+    same rule as grade_short_answer_cloud.py)
   - no extraction record at all for a (student, question) pair -> same as blank
   - LLM/backend failure after generate_structured's internal retries -> scored
     0, needs_review, review_reason carries the error, run continues
@@ -48,12 +50,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PROCESSED_DIR
-from backend.app.db.database import DEFAULT_REVIEW_THRESHOLD, clamp_review_threshold, review_verdict
-from backend.app.grading.grader import llm_grade_mcq
-from backend.app.llm.ollama import ModelUnavailable, OllamaClient
+from _legacy import DEFAULT_REVIEW_THRESHOLD, clamp_review_threshold, llm_grade_mcq, review_verdict
+from backend.app.core.config import PROCESSED_DIR, settings
+from backend.app.llm.errors import ModelUnavailable
+from backend.app.llm.nvidia import NvidiaClient
 
-DEFAULT_MODEL = "qwen2.5:3b"
+DEFAULT_MODEL = settings.nvidia_llm_model
 
 
 def _load_manifest(path: Path) -> tuple[list[dict[str, Any]], float | None]:
@@ -87,7 +89,13 @@ def _load_extracted_answers(path: Path) -> dict[tuple[str, str], str]:
     return out
 
 
-def _blank_result(record: dict[str, Any], extracted_answer: str, reason: str) -> dict[str, Any]:
+def _blank_result(
+    record: dict[str, Any],
+    extracted_answer: str,
+    reason: str,
+    needs_review: bool = True,
+    confidence: float = 0.0,
+) -> dict[str, Any]:
     return {
         "student_id": record["student_id"],
         "question_id": record["question_id"],
@@ -99,8 +107,8 @@ def _blank_result(record: dict[str, Any], extracted_answer: str, reason: str) ->
         "max_marks": float(record["max_marks"]),
         "manual_marks": record.get("manual_marks"),
         "awarded_marks": 0.0,
-        "confidence": 0.0,
-        "needs_review": True,
+        "confidence": confidence,
+        "needs_review": needs_review,
         "review_reason": reason,
         "absolute_error": (
             round(abs(0.0 - float(record["manual_marks"])), 2)
@@ -108,20 +116,26 @@ def _blank_result(record: dict[str, Any], extracted_answer: str, reason: str) ->
             else None
         ),
         "llm_model": None,
-        "status": "needs_review",
+        "status": "needs_review" if needs_review else "scored",
     }
 
 
 def grade_record(
     record: dict[str, Any],
     extracted_answer: str,
-    client: OllamaClient,
+    client: NvidiaClient,
     model: str,
     review_threshold: float = DEFAULT_REVIEW_THRESHOLD,
 ) -> dict[str, Any]:
     if not extracted_answer.strip():
+        # Nothing to grade: score 0 deterministically, no LLM call, and keep it out of the
+        # review queue. confidence=1.0 is certainty in the 0-mark decision itself.
         return _blank_result(
-            record, extracted_answer, "No answer extracted (blank or OCR failure)."
+            record,
+            extracted_answer,
+            "No answer extracted -- question appears to have been left blank.",
+            needs_review=False,
+            confidence=1.0,
         )
 
     try:
@@ -179,7 +193,10 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=PROCESSED_DIR / "results_mcq.json")
     parser.add_argument(
-        "--model", default=DEFAULT_MODEL, help=f"Ollama model tag (default {DEFAULT_MODEL})"
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"NVIDIA model ID (default {DEFAULT_MODEL}; set RUBRICTRACE_NVIDIA_LLM_MODEL "
+        "to change the default)",
     )
     parser.add_argument(
         "--review-threshold",
@@ -214,7 +231,7 @@ def main() -> None:
             raise SystemExit(f"No records matched --student {args.student} in {args.manifest}")
 
     extracted = _load_extracted_answers(args.extracted)
-    client = OllamaClient()
+    client = NvidiaClient()
 
     results: list[dict[str, Any]] = []
     done_keys: set[tuple[str, str]] = set()
@@ -254,7 +271,7 @@ def main() -> None:
         pending = pending[: args.limit]
 
     print(
-        f"[mcq] {len(pending)} pending record(s) to grade with {args.model} (local Ollama)…",
+        f"[mcq] {len(pending)} pending record(s) to grade with {args.model} (NVIDIA)…",
         flush=True,
     )
 

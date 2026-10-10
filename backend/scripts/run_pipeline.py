@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.grading.pipeline import run_pipeline
+from backend.app.grading.batch import BatchGrader
 
 
 def main() -> None:
@@ -24,7 +25,8 @@ def main() -> None:
         "for more than one. Use this for a quick validation run before the full batch.",
     )
     args = parser.parse_args()
-    payload = run_pipeline(args.metadata, args.output, student_ids=args.student)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    payload = BatchGrader().run(args.metadata, args.output, student_ids=args.student)
     print(f"Wrote {args.output}")
     print(payload["summary"])
 

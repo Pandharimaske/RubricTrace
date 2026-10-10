@@ -50,7 +50,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PROCESSED_DIR
+from backend.app.core.config import PROCESSED_DIR
 
 
 def _load_results(path: Path, default_question_type: str) -> list[dict[str, Any]]:

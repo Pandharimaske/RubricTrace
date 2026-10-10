@@ -1,77 +1,109 @@
 """Student script upload, extraction, and script detail endpoints."""
 
+import threading
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-from backend.app.core.settings import PAGE_IMAGE_DIR, UPLOAD_DIR
-from backend.app.core.storage import delete_upload, save_upload
-from backend.app.db.database import (
-    get_db,
-    get_evaluations_for_script,
-    get_extractions_for_script,
-    get_script,
-    get_script_totals,
-    get_student,
-    init_db,
-    insert_script,
-    list_all_scripts,
-    upsert_student,
-)
-from backend.app.db.exams import get_exam
-from backend.app.extraction.process import process_script_file
-from backend.app.llm.ollama import ModelUnavailable
+from backend.app.api.deps import ContainerDep
+from backend.app.container import Container
+from backend.app.core.storage import UploadRejected
+from backend.app.llm.errors import ModelUnavailable
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/scripts", tags=["scripts"])
-init_db()
+
+_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+
+# One render at a time: the review table asks for many thumbnails of the same script at once,
+# and two requests must not render (and write) the same PDF concurrently.
+_RENDER_LOCK = threading.Lock()
+
+
+def _page_files(page_dir: Path, page_number: int) -> list[Path]:
+    return sorted(page_dir.glob(f"*_page_{page_number}.*")) if page_dir.is_dir() else []
+
+
+def _render_pages(
+    c: Container, script: dict[str, Any], page_dir: Path, page_number: int
+) -> list[Path]:
+    source = Path(script["file_path"])
+    if not source.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"The original file is missing ({source}), so page images can't be rendered.",
+        )
+    try:
+        pages = c.reader.render_pages(source, page_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if script.get("page_count") != len(pages):
+        c.scripts.set_status(
+            script["script_id"], script["status"], page_count=len(pages), error=script.get("error")
+        )
+    matches = _page_files(page_dir, page_number)
+    if not matches:
+        raise HTTPException(
+            status_code=404, detail=f"Page {page_number} does not exist ({len(pages)} pages)."
+        )
+    return matches
 
 
 @router.post("/upload")
 async def upload_script(
     file: UploadFile,
+    c: ContainerDep,
     student_id: str | None = Form(None),
     student_name: str | None = Form(None),
     exam_id: str | None = Form(None),
 ) -> dict[str, object]:
-    if exam_id:
-        with get_db() as conn:
-            if not get_exam(conn, exam_id):
-                raise HTTPException(status_code=404, detail="Exam not found")
+    if exam_id and not c.exams.get(exam_id):
+        raise HTTPException(status_code=404, detail="Exam not found")
 
-    script_id, path, size = await save_upload(file)
+    # Reject oversize uploads before reading them into memory when the size is known.
+    if file.size is not None and file.size > c.config.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is larger than the {c.config.max_upload_mb} MB limit.",
+        )
+    content = await file.read()
+    try:
+        stored = c.storage.save(file.filename or "", file.content_type, content)
+    except UploadRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     sid = (student_id or "").strip() or uuid4().hex
     name = (student_name or "").strip() or Path(file.filename or "").stem or sid
-    upsert_student(sid, name)
-    insert_script(script_id, sid, file.filename or "script", str(path), exam_id or None)
+    c.students.upsert(sid, name)
+    c.scripts.insert(stored.script_id, sid, file.filename or "script", str(stored.path), exam_id)
     return {
-        "script_id": script_id,
+        "script_id": stored.script_id,
         "student_id": sid,
         "exam_id": exam_id,
         "filename": file.filename,
         "content_type": file.content_type,
-        "bytes": size,
-        "path": str(path),
+        "bytes": stored.size,
+        "path": str(stored.path),
         "message": "Upload saved.",
     }
 
 
 @router.post("/{script_id}/process")
-def process_script(script_id: str, body: dict | None = None) -> dict[str, object]:
-    matches = list(UPLOAD_DIR.glob(f"{script_id}.*"))
-    if not matches:
+def process_script(script_id: str, c: ContainerDep) -> dict[str, object]:
+    script = c.scripts.get(script_id)
+    if not script or not Path(script["file_path"]).is_file():
         raise HTTPException(status_code=404, detail="Script not found")
-    script_path = matches[0]
-    with get_db() as conn:
-        script_row = get_script(conn, script_id)
-        exam = (
-            get_exam(conn, script_row["exam_id"])
-            if script_row and script_row.get("exam_id")
-            else None
-        )
-    question_ids = [q["question_id"] for q in exam["questions"]] if exam else None
+    script_path = Path(script["file_path"])
     try:
-        extracted = process_script_file(script_id, script_path, question_ids or None)
+        processed = c.processor.process(script_id, script_path)
     except ModelUnavailable as exc:
         raise HTTPException(
             status_code=503, detail=f"VLM extraction is required and unavailable: {exc}"
@@ -79,88 +111,86 @@ def process_script(script_id: str, body: dict | None = None) -> dict[str, object
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    questions = extracted["questions"]
+    reading = processed.reading
     return {
         "script_id": script_id,
         "source": str(script_path),
-        "page_count": extracted["page_count"],
-        "pages": extracted["pages"],
+        "page_count": reading.page_count,
+        "pages": reading.pages,
         "extraction": {
-            "method": extracted["method"],
-            "page_count": extracted["page_count"],
+            "method": reading.method,
+            "page_count": reading.page_count,
             "ocr_required": False,
-            "text": "\n".join(f"{qid}: {text}" for qid, text in questions.items()),
-            "questions": questions,
-            "vlm_model": extracted["vlm_model"],
-            "conflicts": extracted.get("conflicts", []),
+            "text": "\n".join(f"{qid}: {text}" for qid, text in reading.questions.items()),
+            "questions": reading.questions,
+            "vlm_model": reading.vlm_model,
+            "conflicts": reading.conflicts,
         },
-        "extractions": extracted["extractions"],
+        "extractions": processed.extractions,
     }
 
 
 @router.get("")
-def list_scripts() -> dict[str, object]:
-    with get_db() as conn:
-        return {"scripts": list_all_scripts(conn)}
+def list_scripts(c: ContainerDep) -> dict[str, object]:
+    return {"scripts": c.scripts.list_all()}
 
 
 @router.get("/{script_id}/extractions")
 @router.get("/{script_id}/crops", include_in_schema=False)
-def get_script_extractions(script_id: str) -> dict[str, object]:
-    with get_db() as conn:
-        return {"script_id": script_id, "extractions": get_extractions_for_script(conn, script_id)}
+def get_script_extractions(script_id: str, c: ContainerDep) -> dict[str, object]:
+    return {"script_id": script_id, "extractions": c.extractions.for_script(script_id)}
 
 
 @router.get("/{script_id}/pages/{page_number}/image")
-def get_page_image(script_id: str, page_number: int) -> FileResponse:
-    page_dir = PAGE_IMAGE_DIR / script_id
-    if not page_dir.is_dir():
-        raise HTTPException(status_code=404, detail="No rendered pages for this script")
-    matches = sorted(page_dir.glob(f"*_page_{page_number}.*"))
-    if not matches:
-        raise HTTPException(status_code=404, detail=f"Page {page_number} image not found")
-    media_type = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".tif": "image/tiff",
-        ".tiff": "image/tiff",
-    }.get(matches[0].suffix.lower(), "application/octet-stream")
+def get_page_image(script_id: str, page_number: int, c: ContainerDep) -> FileResponse:
+    script = c.scripts.get(script_id)
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    page_dir = c.config.page_image_dir / script_id
+    # Scripts inserted straight into the database (e.g. the imported dataset) were never
+    # rendered, so render them from the original file the first time a page is requested.
+    # The lock is taken even to look: a page file seen mid-render may be half-written.
+    with _RENDER_LOCK:
+        matches = _page_files(page_dir, page_number) or _render_pages(
+            c, script, page_dir, page_number
+        )
+    media_type = _IMAGE_TYPES.get(matches[0].suffix.lower(), "application/octet-stream")
     return FileResponse(str(matches[0]), media_type=media_type)
 
 
 @router.get("/{script_id}")
-def get_script_detail(script_id: str) -> dict[str, object]:
-    with get_db() as conn:
-        script = get_script(conn, script_id)
-        if not script:
-            raise HTTPException(status_code=404, detail="Script not found")
-        extractions = get_extractions_for_script(conn, script_id)
-        evals = get_evaluations_for_script(conn, script_id)
-        totals = get_script_totals(conn, script_id)
-        exam = get_exam(conn, script["exam_id"]) if script.get("exam_id") else None
-        student = get_student(conn, script["student_id"])
+def get_script_detail(script_id: str, c: ContainerDep) -> dict[str, object]:
+    script = c.scripts.get(script_id)
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    extractions = c.extractions.for_script(script_id)
+    evaluations = c.evaluations.for_script(script_id)
+    totals = c.evaluations.totals_for_script(script_id)
+    exam = c.exams.get(script["exam_id"]) if script.get("exam_id") else None
+    student = c.students.get(script["student_id"])
+
     answer_by_question = {item["question_id"]: item["extracted_text"] for item in extractions}
-    for evaluation in evals:
+    for evaluation in evaluations:
         evaluation["answer_text"] = evaluation.get("answer_text") or answer_by_question.get(
             evaluation["question_id"], ""
         )
+    exam_summary: dict[str, Any] | None = (
+        {"exam_id": exam["exam_id"], "name": exam["name"]} if exam else None
+    )
     return {
         "script": script,
         "student": student,
-        "exam": {"exam_id": exam["exam_id"], "name": exam["name"]} if exam else None,
+        "exam": exam_summary,
         "extractions": extractions,
-        "evaluations": evals,
+        "evaluations": evaluations,
         "totals": totals,
     }
 
 
 @router.delete("/{script_id}")
-def delete_script(script_id: str) -> dict[str, str]:
-    with get_db() as conn:
-        if not get_script(conn, script_id):
-            raise HTTPException(status_code=404, detail="Script not found")
-        conn.execute("DELETE FROM scripts WHERE script_id=?", (script_id,))
-    for leftover in UPLOAD_DIR.glob(f"{script_id}.*"):
-        delete_upload(script_id, leftover)
+def delete_script(script_id: str, c: ContainerDep) -> dict[str, str]:
+    if not c.scripts.get(script_id):
+        raise HTTPException(status_code=404, detail="Script not found")
+    c.scripts.delete(script_id)
+    c.storage.delete(script_id)
     return {"deleted": script_id}

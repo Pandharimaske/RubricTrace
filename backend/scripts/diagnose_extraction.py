@@ -12,14 +12,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Import settings to load .env file
-
-from backend.app.extraction.questions import extract_script_questions
+from backend.app.extraction.reader import ScriptReader
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET_ROOT = (
@@ -49,22 +48,18 @@ def main() -> None:
         else [f"Q{i}" for i in range(1, 36)]
     )
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     print(f"Extracting {script_path.name} with hint IDs: {question_ids}\n")
-    result = extract_script_questions(
+    result = ScriptReader().read(
         script_path,
         ROOT / "data/processed/diagnose" / args.student_id,
-        None,
         question_ids=question_ids,
     )
 
-    print(
-        f"Method: {result['method']}  |  Model: {result['vlm_model']}  |  Pages: {result['page_count']}\n"
-    )
-    questions = result["questions"]
+    print(f"Method: {result.method}  |  Model: {result.vlm_model}  |  Pages: {result.page_count}\n")
+    questions = result.questions
     if not questions:
-        print(
-            "!! No questions were extracted at all. Check Ollama is running and the model is pulled."
-        )
+        print("!! No questions were extracted at all. Check NVIDIA_API_KEY and the vision model.")
         return
 
     empty = [qid for qid, text in questions.items() if not text.strip()]
@@ -82,7 +77,7 @@ def main() -> None:
         print("\n--- Empty (nothing extracted) ---")
         print(f"  {sorted(empty, key=lambda q: (len(q), q))}")
 
-    conflicts = result.get("conflicts") or []
+    conflicts = result.conflicts
     if conflicts:
         print(f"\n--- Flagged for manual review ({len(conflicts)}) ---")
         for item in conflicts:

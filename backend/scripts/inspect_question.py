@@ -28,7 +28,6 @@ def main() -> None:
 
     payload = json.loads(args.results.read_text(encoding="utf-8"))
     results = payload.get("results", payload)
-    wanted = set(args.question_ids)
 
     for qid in args.question_ids:
         recs = [r for r in results if r["question_id"] == qid and r.get("manual_marks") is not None]

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,48 +10,13 @@ from backend.app.api.routers.review import router as review_router
 from backend.app.api.routers.rubrics import router as rubrics_router
 from backend.app.api.routers.scripts import router as scripts_router
 from backend.app.api.routers.students import router as students_router
-from backend.app.db.database import init_db
-from backend.app.db.exams import mark_interrupted_jobs
+from backend.app.container import Container
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    init_db()
-    mark_interrupted_jobs()  # a restart kills any job that was mid-run
-    yield
-
-
-app = FastAPI(
-    title="RubricTrace API",
-    description=(
-        "Self-hosted teacher-in-the-loop rubric-based evaluation of scanned answer scripts."
-    ),
-    version="2.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-for api_router in (
-    health_router,
-    students_router,
-    scripts_router,
-    grading_router,
-    rubrics_router,
-    review_router,
-    exams_router,
-):
-    app.include_router(api_router, prefix="/api")
+WEB_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
 class SPAStaticFiles(StaticFiles):
@@ -66,11 +32,58 @@ class SPAStaticFiles(StaticFiles):
             raise
 
 
-WEB_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-if WEB_DIST.exists():
-    app.mount("/", SPAStaticFiles(directory=str(WEB_DIST), html=True), name="static")
-else:
+def create_app(container: Container | None = None) -> FastAPI:
+    """Build the application. Tests pass a Container wired to a temporary database."""
+    container = container or Container()
 
-    @app.get("/")
-    def root() -> dict[str, str]:
-        return {"status": "ok", "service": "RubricTrace API", "version": "2.0.0"}
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        )
+        container.config.ensure_data_dirs()
+        container.startup()
+        yield
+        container.shutdown()
+
+    app = FastAPI(
+        title="RubricTrace API",
+        description=(
+            "Self-hosted teacher-in-the-loop rubric-based evaluation of scanned answer scripts."
+        ),
+        version="2.0.0",
+        lifespan=lifespan,
+    )
+    app.state.container = container
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=container.config.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    for api_router in (
+        health_router,
+        students_router,
+        scripts_router,
+        grading_router,
+        rubrics_router,
+        review_router,
+        exams_router,
+    ):
+        app.include_router(api_router, prefix="/api")
+
+    if WEB_DIST.exists():
+        app.mount("/", SPAStaticFiles(directory=str(WEB_DIST), html=True), name="static")
+    else:
+
+        @app.get("/")
+        def root() -> dict[str, str]:
+            return {"status": "ok", "service": "RubricTrace API", "version": "2.0.0"}
+
+    return app
+
+
+app = create_app()

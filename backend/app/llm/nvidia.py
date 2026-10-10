@@ -1,20 +1,17 @@
 """
-Cloud model client for NVIDIA's OpenAI-compatible NIM API (https://integrate.api.nvidia.com/v1).
-
-Mirrors OllamaClient's generate() signature so callers (ai_assistance.py, grader.py)
-can swap between the local Ollama backend and this cloud backend without changing
-any calling code — see provider.py, which picks one based on RUBRICTRACE_MODEL_PROVIDER.
+Client for NVIDIA's OpenAI-compatible NIM API (https://integrate.api.nvidia.com/v1), the
+only model backend RubricTrace uses. See provider.py for how the VLM and LLM are chosen.
 """
 
 from __future__ import annotations
 
 import base64
 import mimetypes
-import os
 from pathlib import Path
 from typing import Any
 
-from backend.app.llm.ollama import ModelUnavailable
+from backend.app.core.config import settings
+from backend.app.llm.errors import ModelUnavailable
 
 
 class NvidiaClient:
@@ -31,19 +28,18 @@ class NvidiaClient:
         self.extra_body = extra_body
         # The OpenAI SDK retries 429/5xx with exponential backoff on its own; the
         # free NIM endpoints rate-limit, so give it more attempts than its default 2.
-        self.sdk_max_retries = int(os.getenv("RUBRICTRACE_NVIDIA_SDK_MAX_RETRIES", "5"))
-        self.api_key = api_key or os.getenv("NVIDIA_API_KEY")
-        self.base_url = base_url or os.getenv(
-            "NVIDIA_API_BASE_URL", "https://integrate.api.nvidia.com/v1"
-        )
-        self.timeout = float(os.getenv("RUBRICTRACE_MODEL_TIMEOUT", "120"))
-        self._client = None  # lazily constructed so a missing api key raises on use, not import
+        self.sdk_max_retries = settings.nvidia_sdk_max_retries
+        self.api_key = api_key or settings.nvidia_api_key
+        self.base_url = base_url or settings.nvidia_api_base_url
+        self.timeout = settings.model_timeout
+        # Built lazily so a missing api key raises on first use, not at import.
+        self._client: Any = None
 
     def _get_client(self):
         if not self.api_key:
             raise ModelUnavailable(
-                "NVIDIA_API_KEY is not set. Add it to .env (or export it) to use "
-                "RUBRICTRACE_MODEL_PROVIDER=nvidia."
+                "NVIDIA_API_KEY is not set. Add it to backend/.env (or export it); get a key at "
+                "https://build.nvidia.com/settings."
             )
         if self._client is None:
             try:
@@ -102,11 +98,11 @@ class NvidiaClient:
         # Both call sites here (page transcription, JSON structuring/grading) want the
         # model's most faithful reading of what's in front of it, not creative
         # variation, so temperature defaults to 0 across the board.
-        temperature = float(os.getenv("RUBRICTRACE_MODEL_TEMPERATURE", "0.0"))
+        temperature = settings.model_temperature
         # A page extraction returns the raw transcript AND the per-question answers
         # in one JSON object (the text appears twice), and a reasoning model's
         # thinking tokens can count against this budget too, so it needs real headroom.
-        max_tokens = int(os.getenv("RUBRICTRACE_MODEL_MAX_TOKENS", "8192"))
+        max_tokens = settings.model_max_tokens
         request: dict[str, Any] = {
             "model": model,
             "messages": messages,

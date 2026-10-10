@@ -39,9 +39,11 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.settings import PROCESSED_DIR, PROJECT_ROOT
-from backend.app.db.database import get_db
-from backend.app.db.exams import create_exam, list_exams, update_exam
+from backend.app.core.config import PROCESSED_DIR, PROJECT_ROOT
+from backend.app.db.database import default_database, get_db
+from backend.app.db.exams import ExamRepository
+
+EXAMS = ExamRepository(default_database)
 
 STUDENT_PDF_DIR = (
     PROJECT_ROOT
@@ -57,12 +59,10 @@ EXAM_NAME_DEFAULT = "Mendeley Benchmark — 50 Students"
 
 
 def _find_or_create_exam(name: str) -> str:
-    with get_db() as conn:
-        for exam in list_exams(conn):
-            if exam["name"] == name:
-                return exam["exam_id"]
-    exam = create_exam(name)
-    return exam["exam_id"]
+    existing = EXAMS.find_by_name(name)
+    if existing:
+        return str(existing["exam_id"])
+    return str(EXAMS.create(name)["exam_id"])
 
 
 def _build_question_bank(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -103,7 +103,7 @@ def main() -> None:
     # The exam's review threshold is part of its configuration; take the one the
     # grading run used so the imported exam flags exactly what the eval flagged.
     review_threshold = (payload.get("summary") or {}).get("review_confidence_threshold")
-    update_exam(exam_id, questions=questions, review_confidence_threshold=review_threshold)
+    EXAMS.update(exam_id, questions=questions, review_confidence_threshold=review_threshold)
     print(
         f"Answer key set: {len(questions)} questions"
         + (f", review threshold {review_threshold}" if review_threshold is not None else ""),

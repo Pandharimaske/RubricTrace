@@ -16,17 +16,17 @@ Two entry points:
 Neither entry point returns needs_review. The model is never asked for it (a
 model-filled flag kept contradicting its own confidence); it is derived from the
 stored confidence and the exam's review threshold by the caller -- see
-backend/app/db/database.py (review_verdict / effective_status).
+backend/app/models/domain.py (ReviewPolicy).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-from typing import Any
+from typing import Any, cast
 
-from backend.app.llm.provider import ModelClient, get_llm_client_and_model
+from backend.app.core.config import Settings, settings
+from backend.app.llm.provider import ModelClient, ModelProvider
 from backend.app.llm.structured import (
     GraderOutput,
     MCQGraderOutput,
@@ -330,123 +330,90 @@ def _build_mcq_prompt(
     )
 
 
-def llm_grade(
-    question_id: str,
-    student_answer: str,
-    golden_answer: str,
-    rubric: list[dict[str, Any]],
-    max_marks: float,
-    guidance: str = "",
-    question_text: str = "",
-    question_type: str = "",
-    client: ModelClient | None = None,
-    model: str | None = None,
-) -> tuple[dict[str, Any], str]:
-    """
-    Grade a student answer with the LLM (full reasoning — GraderOutput shape).
+class LLMGrader:
+    """Grader engine evaluating student answers with LLMs (descriptive and objective)."""
 
-    Parameters
-    ----------
-    client, model : pass both together to pin grading to a specific backend/model
-        regardless of the global RUBRICTRACE_MODEL_PROVIDER — e.g. a batch script
-        that wants short-answer grading on Groq/NVIDIA while a sibling process
-        grades MCQs locally via llm_grade_mcq(). If client is given without model,
-        this falls back to RUBRICTRACE_LLM_MODEL (or "qwen2.5:3b"), which is almost
-        never what you want for a non-Ollama client — pass model explicitly.
-        If both are omitted, the provider/model come from get_llm_client_and_model()
-        (i.e. RUBRICTRACE_MODEL_PROVIDER).
+    def __init__(
+        self,
+        client: ModelClient | None = None,
+        model: str | None = None,
+        config: Settings | None = None,
+    ) -> None:
+        self.config = config or settings
+        self.client = client
+        self.model = model
 
-    Returns
-    -------
-    (grading_result_dict, model_name)
+    def resolve(self) -> tuple[ModelClient, str]:
+        """The (client, model) used for grading: the injected ones, else the NVIDIA grading
+        model. An injected client without a model uses the configured grading model."""
+        if self.client is None:
+            client, default_model = ModelProvider(self.config).llm()
+            return client, self.model or default_model
+        return self.client, self.model or self.config.nvidia_llm_model
 
-    Raises
-    ------
-    ModelUnavailable  if the configured model backend is unreachable or returns
-    invalid output (local Ollama, or NVIDIA's/Groq's cloud API — see provider.py).
-    """
-    if client is None:
-        client, model = get_llm_client_and_model()
-    elif model is None:
-        model = os.getenv("RUBRICTRACE_LLM_MODEL", "qwen2.5:3b")
+    def grade(
+        self,
+        question_id: str,
+        student_answer: str,
+        golden_answer: str,
+        rubric: list[dict[str, Any]],
+        max_marks: float,
+        guidance: str = "",
+        question_text: str = "",
+        question_type: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        """Grade a student answer with the LLM (full reasoning — GraderOutput shape)."""
+        client, model = self.resolve()
 
-    full_prompt = (
-        _SYSTEM_PROMPT
-        + "\n\n---\n\n"
-        + _build_prompt(
-            question_id,
-            question_text,
-            student_answer,
-            golden_answer,
-            rubric,
-            max_marks,
-            guidance,
-            question_type,
+        full_prompt = (
+            _SYSTEM_PROMPT
+            + "\n\n---\n\n"
+            + _build_prompt(
+                question_id,
+                question_text,
+                student_answer,
+                golden_answer,
+                rubric,
+                max_marks,
+                guidance,
+                question_type,
+            )
         )
-    )
 
-    parsed = generate_structured(client, model, full_prompt, GraderOutput)
-    result = parsed.model_dump()
+        parsed = generate_structured(client, model, full_prompt, GraderOutput)
+        result = parsed.model_dump()
 
-    awarded = max(0.0, min(result["awarded_marks"], max_marks))
-    result["awarded_marks"] = round(awarded, 2)
+        awarded = max(0.0, min(result["awarded_marks"], max_marks))
+        result["awarded_marks"] = round(awarded, 2)
 
-    confidence = max(0.0, min(result["confidence"], 1.0))
-    result["confidence"] = round(confidence, 2)
+        confidence = max(0.0, min(result["confidence"], 1.0))
+        result["confidence"] = round(confidence, 2)
 
-    # needs_review is not decided here: only confidence is returned. The caller
-    # judges it against the exam's review threshold (see module docstring).
+        return result, model
 
-    return result, model
+    def grade_mcq(
+        self,
+        question_id: str,
+        student_answer: str,
+        golden_answer: str,
+        question_text: str = "",
+    ) -> tuple[dict[str, Any], str]:
+        """Grade an objective MCQ question (lean — MCQGraderOutput shape)."""
+        client, model = self.resolve()
 
+        full_prompt = (
+            _MCQ_SYSTEM_PROMPT
+            + "\n\n---\n\n"
+            + _build_mcq_prompt(question_id, question_text, student_answer, golden_answer)
+        )
 
-def llm_grade_mcq(
-    question_id: str,
-    student_answer: str,
-    golden_answer: str,
-    question_text: str = "",
-    client: ModelClient | None = None,
-    model: str | None = None,
-) -> tuple[dict[str, Any], str]:
-    """
-    Grade a single objective MCQ/true-false question (lean — MCQGraderOutput
-    shape: correct-or-not, no reasoning chain). Intended for a small, fast,
-    local model (qwen2.5:3b by default) since the task is a single semantic
-    match, not open-ended judgment — see _MCQ_SYSTEM_PROMPT.
+        parsed = cast(
+            MCQGraderOutput, generate_structured(client, model, full_prompt, MCQGraderOutput)
+        )
+        confidence = round(max(0.0, min(float(parsed.confidence), 1.0)), 2)
 
-    Same client/model override behavior as llm_grade(): pass both to pin this
-    to a specific backend regardless of the global provider setting.
-
-    Returns
-    -------
-    (grading_result_dict, model_name) — grading_result_dict has keys
-    is_correct, confidence, reasoning. No needs_review: derive it from confidence
-    against the exam's review threshold (database.review_verdict).
-
-    Raises
-    ------
-    ModelUnavailable  if the configured model backend is unreachable or returns
-    invalid output.
-    """
-    if client is None:
-        client, model = get_llm_client_and_model()
-    elif model is None:
-        model = os.getenv("RUBRICTRACE_LLM_MODEL", "qwen2.5:3b")
-
-    full_prompt = (
-        _MCQ_SYSTEM_PROMPT
-        + "\n\n---\n\n"
-        + _build_mcq_prompt(question_id, question_text, student_answer, golden_answer)
-    )
-
-    parsed = generate_structured(client, model, full_prompt, MCQGraderOutput)
-
-    confidence = round(max(0.0, min(float(parsed.confidence), 1.0)), 2)
-
-    # needs_review is not decided here: only confidence is returned (see module docstring).
-
-    return {
-        "is_correct": bool(parsed.is_correct),
-        "confidence": confidence,
-        "reasoning": (parsed.reasoning or "").strip(),
-    }, model
+        return {
+            "is_correct": bool(parsed.is_correct),
+            "confidence": confidence,
+            "reasoning": (parsed.reasoning or "").strip(),
+        }, model

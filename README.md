@@ -1,261 +1,137 @@
 # RubricTrace
 
-RubricTrace is a self-hosted teacher-in-the-loop framework for rubric-based evaluation of scanned student answer scripts.
+Teacher-in-the-loop grading for handwritten exam scripts. A teacher sets up an exam once
+(questions, question types, reference answers, optional rubric, max marks), uploads scanned
+student papers in bulk, and RubricTrace reads every answer with a vision-language model, grades
+it against the reference answer, explains each mark, and sends the answers it is unsure about
+to a review queue. Teacher decisions are final and are never overwritten by a re-grade.
 
-The project is designed to be free to run locally: no paid API keys, no closed-model dependency, and no cloud requirement for the MVP.
+Self-hosted application with a cloud model backend: SQLite by default, models served by the
+NVIDIA API, and PostgreSQL / S3-compatible storage optional. No local model runtime is needed.
 
-## MVP Goals
+## How it works
 
-- Upload scanned answer scripts as PDF or image files.
-- Convert scripts to page images.
-- Extract OCR text and bounding boxes.
-- Group extracted text question-wise.
-- Score answers against rubric criteria.
-- Show evidence, confidence, and review flags.
-- Allow teacher score override.
-- Compare predicted marks with manual marks from a public dataset.
+1. **Author the exam**: add questions of any type (MCQ, true/false, short answer, long answer),
+   the answer key, options, rubric criteria, and a review-confidence threshold.
+2. **Upload scripts** (PDF or images) in bulk. Files are validated by type and size.
+3. **Read**: each page is rendered to an image and sent to a VLM once, which returns the
+   page's answers attached to question numbers. Blank pages are skipped, continuations across
+   pages are merged, and illegible, duplicated or unattributable content is flagged for review.
+   Page results are cached on disk so a crash or re-run does not re-spend model quota.
+4. **Grade**: objective questions whose marked option is unambiguous are graded
+   deterministically (no model call, full confidence). Everything else is graded by an LLM
+   against the reference answer and rubric, with reasoning and per-criterion scores.
+5. **Review**: an answer whose confidence is below its threshold lands in the review queue. The
+   threshold is configuration, so changing it re-sorts existing grades without a re-grade.
+6. **Results**: a student x question grid with totals and CSV export.
 
-## Tech Stack
-
-- Backend: FastAPI
-- Frontend: React + Vite (industry-grade SPA)
-- OCR: PaddleOCR first, with fallback hooks for other OCR engines
-- Image/PDF processing: OpenCV, Pillow, PyMuPDF
-- Scoring: scikit-learn, sentence-transformers
-- Storage: SQLite/PostgreSQL for metadata and local files or S3-compatible object storage
-
-## Project Structure
+## Architecture
 
 ```text
 RubricTrace/
   backend/
     app/
-      api/
-      core/
-      models/
-      services/
-        confidence/
-        evaluation/
-        ocr/
-        scoring/
-    data/
-    eval/
-    scripts/
-    deploy/
-    .env.example
-  frontend/
-    src/
-      pages/
-      components/
-      api.js
-      App.jsx
-    index.html
-    package.json
-    vite.config.js
+      main.py            create_app(): wires the container, CORS, routers, built frontend
+      container.py       Container: builds every service from one Settings + Database
+      api/               FastAPI routers (exams, scripts, grading, review, ...) + deps.py
+      core/              Settings (pydantic-settings), UploadStorage (+ S3 / Supabase mirrors)
+      db/                Database (connection + schema + migrations), repository classes
+      models/            domain.py (QuestionSpec, GradeResult, ReviewPolicy), API schemas
+      extraction/        ScriptReader, ScriptExtractor, ScriptProcessor, merge/review logic
+      grading/           evaluators, AnswerGrader, GradingService, BatchGrader, JobRunner
+      llm/               ModelProvider and the NVIDIA client, structured-output validation
+    scripts/             batch evaluation and maintenance scripts (see scripts/README.md)
+    tests/               unit/ and integration/ (in-process API flow, fake models)
+    deploy/              docker compose for Postgres + S3-compatible storage
+  frontend/              React + Vite + React Router + TanStack Query
   docs/
-  notebooks/
-  tests/
 ```
 
-## Quick Start
+The backend is class-based with explicit dependencies: repositories take a `Database`,
+services take repositories and evaluators, and the `Container` is the only place they are
+assembled. Tests build their own container with a temporary database and fake models.
+
+## Quick start
 
 ```bash
-cd ~/Desktop/RubricTrace
 cd backend
 uv sync
-source .venv/bin/activate
+cp .env.example .env        # then set NVIDIA_API_KEY
+cd ..
+./backend/scripts/run_api.sh    # API on http://127.0.0.1:8000 (docs at /docs)
+./backend/scripts/run_ui.sh     # UI on http://localhost:5173
 ```
 
-Run the API:
+`./backend/scripts/run_all.sh` starts both. Check the environment with
+`uv run python backend/scripts/check_setup.py`.
 
-```bash
-./backend/scripts/run_api.sh
-```
+### Models
 
-The API is available at `http://127.0.0.1:8000`. The health check is
-`GET /api/health`, and the interactive API documentation is available at
-`http://127.0.0.1:8000/docs`.
+Both models run on NVIDIA's API (get a key at https://build.nvidia.com/settings and set
+`NVIDIA_API_KEY` in `backend/.env`):
 
-Run the React frontend:
+- **Vision (reads the pages):** `moonshotai/kimi-k3`, override with
+  `RUBRICTRACE_NVIDIA_VLM_MODEL`. If its free endpoint is slow or throttled, try
+  `meta/llama-3.2-90b-vision-instruct`.
+- **Grading:** `openai/gpt-oss-20b`, override with `RUBRICTRACE_NVIDIA_LLM_MODEL`.
 
-```bash
-./backend/scripts/run_ui.sh
-```
+If the API is unreachable or the key is missing, extraction and grading fail with a clear
+error instead of falling back to keyword matching.
 
-Or manually:
+### Other configuration
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+All settings are `RUBRICTRACE_*` environment variables (see `backend/.env.example`):
+`CORS_ORIGINS` (JSON list), `MAX_UPLOAD_MB`, `DATA_ROOT`, `DATABASE_URL` (PostgreSQL),
+`STORAGE_BACKEND` (`local` | `s3` | `supabase`), `EXTRACTION_CACHE`, `MODEL_TIMEOUT`.
 
-Run both backend and frontend together:
-
-```bash
-./backend/scripts/run_all.sh
-```
-
-Open the dashboard at `http://localhost:5173`. Start the API before using the
-upload or scoring controls in the dashboard.
-
-Teacher evaluation workflow:
-
-1. Upload and process a student script to receive its `script_id`.
-2. Submit `POST /api/scripts/{script_id}/evaluate` with golden answers,
-  criteria, max marks, and grading guidance for each question.
-3. Review saved results with `GET /api/scripts/{script_id}/evaluation`.
-4. Approve a corrected score with
-  `POST /api/scripts/{script_id}/override` and a teacher reason.
-
-Evaluations are stored in the SQLite database under `backend/data/rubrictrace.db` by default. Each result
-contains the extracted answer, criterion evidence, confidence, review status,
-optional LLM reasoning, and any teacher override. The React dashboard exposes the
-same workflow through its intuitive interface.
-
-## AWS-shaped local development
-
-The development compose file includes PostgreSQL and an S3-compatible object store so the application can be
-tested against services that resemble the planned AWS deployment:
+### PostgreSQL and S3-compatible storage (optional)
 
 ```bash
 docker compose -f backend/deploy/compose/docker-compose.dev.yml up -d postgres minio
 ```
 
-To use the local PostgreSQL container instead of SQLite, set:
-
 ```env
 RUBRICTRACE_DATABASE_URL=postgresql://rubrictrace:rubrictrace@127.0.0.1:15432/rubrictrace
-```
-
-The schema is created automatically on startup. The same setting can later point
-to an AWS RDS or Aurora PostgreSQL instance. Existing SQLite data is not migrated
-automatically; export or migrate it before switching a non-empty environment.
-
-The local object-store service uses RustFS because current MinIO container images
-require registry authentication in some environments. RustFS provides the same S3
-API at `http://127.0.0.1:9000` with its console at `http://127.0.0.1:9001`. To
-mirror uploads to the local object store, set these values in
-`backend/.env`:
-
-```env
 RUBRICTRACE_STORAGE_BACKEND=s3
 RUBRICTRACE_STORAGE_ENDPOINT_URL=http://127.0.0.1:9000
 RUBRICTRACE_STORAGE_ACCESS_KEY=minioadmin
 RUBRICTRACE_STORAGE_SECRET_KEY=minioadmin
 RUBRICTRACE_STORAGE_BUCKET=rubrictrace
-RUBRICTRACE_STORAGE_REGION=us-east-1
 ```
 
-The upload pipeline keeps a local processing copy because the OCR and VLM libraries
-consume filesystem paths. The S3 object is the durable copy and is deleted when a
-script or exam is deleted. For AWS, use the same S3 client with the endpoint unset,
-IAM credentials or a task role, and an S3 bucket name.
+Uploads always keep a local processing copy (the PDF/VLM libraries read file paths); the S3
+object is the durable copy and is removed when a script or exam is deleted. SQLite data is not
+migrated automatically when switching to PostgreSQL.
 
-Optional extras:
+## Evaluation
+
+The grader is benchmarked on the public Mendeley dataset "A Dataset of Digitized Student
+Examination Papers, Answer Keys, and Manual Evaluations for Automated Grading Research"
+(DOI `10.17632/sf3kvjwknt.1`, CC BY 4.0): 50 anonymised students, Q1-Q35, with item-level
+teacher marks.
+
+On the multiple-choice track (1,000 records) the LLM grader reaches QWK 0.94 and 96.9%
+exact-match accuracy against the teacher's marks. Short-answer grading (567 attempted
+answers) is weaker and is being improved on a held-out test split before numbers are
+reported.
+
+Scripts for reproducing this live in `backend/scripts/` (`run_grading_parallel.sh`,
+`merge_grading_results.py`, `compute_grading_metrics.py`). The metrics script needs
+`uv sync --group eval`. Run the batch pipeline on the bundled demo data:
 
 ```bash
-uv sync --extra ocr --extra dev
-# Add `--extra vision` and/or `--extra embeddings` when needed.
+uv run --project backend python backend/scripts/run_pipeline.py backend/data/samples/demo_metadata.csv
 ```
 
-Use one `uv sync` command containing every extra you want enabled; `uv sync`
-reconciles the environment to the requested dependency groups.
-
-The VLM reads scanned pages and question crops. The LLM is the only grader:
-it scores each answer against the golden answer and rubric, returns reasoning,
-and flags uncertain cases for teacher review. Ollama must be running:
+## Development
 
 ```bash
-ollama serve
-ollama pull qwen2.5vl:3b
-ollama pull qwen2.5:3b
+cd backend
+uv run ruff check . && uv run ruff format --check .
+uv run mypy
+uv run pytest
 ```
 
-Configure models with `RUBRICTRACE_VLM_MODEL` and `RUBRICTRACE_LLM_MODEL`, or
-leave those defaults. If Ollama is unavailable, extraction and grading return
-an error instead of falling back to keyword matching.
-
-Run the batch pipeline on the bundled demo dataset:
-
-```bash
-uv run python backend/scripts/run_pipeline.py backend/data/samples/demo_metadata.csv
-```
-
-Import the selected real dataset:
-
-```bash
-mkdir -p backend/data/raw/mendeley_sf3kvjwknt
-curl -L 'https://data.mendeley.com/public-api/zip/sf3kvjwknt/download/1' \
-  -o backend/data/raw/mendeley_sf3kvjwknt/dataset.zip
-unzip -q backend/data/raw/mendeley_sf3kvjwknt/dataset.zip \
-  -d backend/data/raw/mendeley_sf3kvjwknt/archive
-dataset_root="$(find backend/data/raw/mendeley_sf3kvjwknt/archive -mindepth 1 -maxdepth 1 -type d -print -quit)"
-uv run python backend/scripts/import_mendeley_dataset.py "$dataset_root" \
-  --output backend/data/processed/mendeley_sf3kvjwknt_metadata.csv
-uv run python backend/scripts/run_pipeline.py \
-  backend/data/processed/mendeley_sf3kvjwknt_metadata.csv \
-  --output backend/data/processed/mendeley_sf3kvjwknt_results.json
-```
-
-This project uses “A Dataset of Digitized Student Examination Papers, Answer
-Keys, and Manual Evaluations for Automated Grading Research”, Mendeley Data,
-V1, DOI `10.17632/sf3kvjwknt.1`, licensed CC BY 4.0. It contains 50
-anonymized student exams, raw scanned PDFs, an answer key, and item-level
-teacher marks for Q1–Q35.
-
-The imported run currently contains 1,750 question records. The baseline
-completed OCR on all 200 scanned pages and produced `MAE = 0.878` over 1,567
-records with numeric manual marks. Because handwriting and visual MCQ marks are
-not consistently recognized by generic Tesseract, 181 records had usable
-question-aligned text and 1,569 were correctly flagged `needs_review`. This is
-the expected teacher-in-the-loop behavior, not a claim of reliable automatic
-grading for every scan.
-
-The command writes `backend/data/processed/pipeline_results.json` with extracted
-answers, criterion scores, evidence, confidence, review status, and MAE when
-manual marks are present. Dataset metadata can be CSV or JSON. Each record
-must provide `student_id`, `script_path`, `question_id`, `max_marks`, and a
-`criteria_json` list; `manual_marks` is optional. Script paths are relative to
-the metadata file.
-
-## Current Status
-
-Runnable MVP foundation:
-
-- FastAPI health and rubric scoring endpoints are implemented.
-- PDF and image uploads are persisted under `backend/data/raw/uploads/`.
-- PDF files are converted to page images under `backend/data/processed/page_images/`.
-- Modern React SPA provides upload, processing, rubric scoring, and teacher review interface.
-- Core dependencies are managed with `uv`; `requirements.txt` is retained as
-  as the backend dependency manifest.
-- A batch ingestion and scoring pipeline is available through
-  `backend/scripts/run_pipeline.py`.
-
-Frontend Features:
-
-- Dashboard with statistics and quick actions
-- Student management and detailed student views
-- Script upload with drag-and-drop support
-- Script processing and question segmentation
-- Rubric configuration builder with templates
-- Teacher evaluation workflow with AI confidence scoring
-- Review queue for low-confidence answers requiring teacher review
-- Visual crop images for each question
-- Teacher override capabilities with reasoning
-
-See [docs/frontend_guide.md](docs/frontend_guide.md) for detailed frontend documentation.
-
-Still planned:
-
-- Confidence and evaluation service implementations.
-- Dataset ingestion, manual-score comparison, and persistent metadata storage.
-- Importing and evaluating the selected public examination dataset.
-
-Regression coverage for ingestion, segmentation, and the demo batch pipeline is
-available under `tests/`.
-
-The batch pipeline extracts text from text files and text-based PDFs. With the
-OCR extra installed, scanned images and image-only PDFs are processed through
-local Tesseract OCR. If OCR is unavailable or produces no text, the result is
-reported as `needs_ocr` for teacher review.
+Tests use fake model clients and a temporary data directory, so they need no models, network or
+running server. `tests/integration/test_api_integration.py` additionally runs against a live
+server on `localhost:8000` when one is up and skips otherwise.

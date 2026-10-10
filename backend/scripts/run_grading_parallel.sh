@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs both grading tracks as real, concurrent OS processes:
-#   - grade_mcq_local.py          (local Ollama, sequential, no network)
-#   - grade_short_answer_cloud.py (cloud NVIDIA/Groq, --concurrency in-flight requests)
+#   - grade_mcq.py                (NVIDIA, sequential, lean correct/incorrect verdicts)
+#   - grade_short_answer_cloud.py (NVIDIA, --concurrency in-flight requests)
 # They write to separate output files (results_mcq.json / results_short_answer.json)
 # and never touch each other's state, so they're safe to run at the same time.
 #
@@ -11,15 +11,15 @@
 # Usage:
 #   ./scripts/run_grading_parallel.sh
 #   ./scripts/run_grading_parallel.sh --limit 5                 # smoke test both tracks
-#   ./scripts/run_grading_parallel.sh --provider groq            # short-answer track on Groq
 #   ./scripts/run_grading_parallel.sh --student Student_1 --student Student_2
 #
 # Flags (all optional):
 #   --limit N            Only grade the first N pending records per track (smoke test).
 #   --student ID          Only grade this student_id. Repeatable.
 #   --provider NAME       Cloud provider chain for the short-answer track, comma-separated
-#                         (default nvidia,groq — auto-fails-over on credit/quota exhaustion).
-#   --mcq-model NAME      Ollama model tag for the MCQ track (default qwen2.5:3b).
+#                         (default nvidia).
+#   --mcq-model NAME      NVIDIA model ID for the MCQ track (default: RUBRICTRACE_NVIDIA_LLM_MODEL,
+#                         i.e. openai/gpt-oss-20b).
 #   --concurrency N       In-flight cloud requests for the short-answer track (default 4).
 #   --allow-partial       Merge whatever output exists even if one track failed/was interrupted.
 #
@@ -38,8 +38,8 @@
 set -eo pipefail
 cd "$(dirname "$0")/.."
 
-MCQ_MODEL="qwen2.5:3b"
-PROVIDER="nvidia,groq"
+MCQ_MODEL=""
+PROVIDER="nvidia"
 CONCURRENCY=""
 LIMIT=""
 ALLOW_PARTIAL=""
@@ -66,18 +66,19 @@ done
 
 LOG_DIR="data/processed/logs"
 mkdir -p "$LOG_DIR"
-MCQ_LOG="$LOG_DIR/grade_mcq_local.log"
+MCQ_LOG="$LOG_DIR/grade_mcq.log"
 SA_LOG="$LOG_DIR/grade_short_answer_cloud.log"
 
-MCQ_ARGS=(--model "$MCQ_MODEL" "${STUDENT_ARGS[@]}")
+MCQ_ARGS=("${STUDENT_ARGS[@]}")
+[[ -n "$MCQ_MODEL" ]] && MCQ_ARGS+=(--model "$MCQ_MODEL")
 SA_ARGS=(--provider "$PROVIDER" "${STUDENT_ARGS[@]}")
 [[ -n "$LIMIT" ]] && MCQ_ARGS+=(--limit "$LIMIT") && SA_ARGS+=(--limit "$LIMIT")
 [[ -n "$CONCURRENCY" ]] && SA_ARGS+=(--concurrency "$CONCURRENCY")
 
 echo "=========================================="
 echo "RubricTrace parallel grading"
-echo "  MCQ track:          local Ollama ($MCQ_MODEL)"
-echo "  Short-answer track: cloud ($PROVIDER)"
+echo "  MCQ track:          NVIDIA (${MCQ_MODEL:-default model})"
+echo "  Short-answer track: NVIDIA ($PROVIDER)"
 echo "  Logs:                $MCQ_LOG"
 echo "                        $SA_LOG"
 echo "=========================================="
@@ -101,7 +102,7 @@ echo ""
 # Launch both tracks as background OS processes, each streaming to its own
 # log file (tail -f'd below with a prefix) so a long run's output stays
 # readable instead of the two processes' prints interleaving mid-line.
-run_py scripts/grade_mcq_local.py "${MCQ_ARGS[@]}" >"$MCQ_LOG" 2>&1 &
+run_py scripts/grade_mcq.py "${MCQ_ARGS[@]}" >"$MCQ_LOG" 2>&1 &
 MCQ_PID=$!
 
 run_py scripts/grade_short_answer_cloud.py "${SA_ARGS[@]}" >"$SA_LOG" 2>&1 &
