@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import pymupdf
 import pytest
@@ -35,10 +37,17 @@ def _two_page_pdf(path: Path) -> Path:
 
 
 def _insert_unrendered_script(container: Container, pdf: Path) -> str:
-    """What the dataset importer does: a script row pointing at a PDF, with no page images."""
-    container.students.upsert("student-1", "Student One")
-    container.scripts.insert("script-1", "student-1", pdf.name, str(pdf))
-    return "script-1"
+    """A script whose original is in the upload directory but whose pages were never rendered
+    (what an import produces). When `pdf` does not exist the original is simply missing."""
+    container.config.ensure_data_dirs()
+    exam = container.exams.create("Imported")
+    script_id = str(uuid4())
+    if pdf.is_file():
+        shutil.copy(pdf, container.config.upload_dir / f"{script_id}.pdf")
+    container.scripts.insert(
+        script_id, "student-1", pdf.name, str(pdf), exam["exam_id"], student_name="Student One"
+    )
+    return script_id
 
 
 def test_page_is_rendered_on_first_request(

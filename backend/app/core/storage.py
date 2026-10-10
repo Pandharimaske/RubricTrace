@@ -182,7 +182,7 @@ class UploadStorage:
     def save(self, filename: str, content_type: str | None, content: bytes) -> StoredUpload:
         suffix = self.validate(filename, len(content))
         self._config.ensure_data_dirs()
-        script_id = uuid4().hex
+        script_id = str(uuid4())  # the scripts table uses this as its UUID primary key
         path = self._config.upload_dir / f"{script_id}{suffix}"
         path.write_bytes(content)
         if self._mirror is not None:

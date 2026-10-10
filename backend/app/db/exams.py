@@ -1,33 +1,59 @@
 """Exam-level persistence: exams and their answer key, evaluator configs, per-exam summaries
-and results, and background jobs."""
+and results, and background jobs.
+
+The answer key lives in exam_questions / question_options / rubric_criteria and nowhere else.
+Saving a key upserts questions by (exam_id, question_id), so a question keeps its row id (and
+the grades pointing at it) across edits; questions dropped from the key are deleted, which
+removes their grades too.
+"""
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from typing import Any
-from uuid import uuid4
+from uuid import UUID
 
+import psycopg
 from backend.app.db.database import Connection, Database
+from backend.app.db.repositories import as_uuid, returned
 from backend.app.models.domain import ReviewPolicy
 
+
+class JobConflict(RuntimeError):
+    """A job is already queued or running for this exam."""
+
+
 _SUMMARY_SQL = """
-SELECT e.*,
-  (SELECT COUNT(*) FROM scripts s WHERE s.exam_id = e.exam_id) AS script_count,
-  (SELECT COUNT(*) FROM scripts s WHERE s.exam_id = e.exam_id
-     AND s.status IN ('processed', 'graded', 'needs_review')) AS processed_count,
-  (SELECT COUNT(*) FROM scripts s WHERE s.exam_id = e.exam_id
-     AND s.status = 'error') AS error_count,
-  (SELECT COUNT(DISTINCT qe.script_id) FROM question_evaluations qe
-     JOIN scripts s ON s.script_id = qe.script_id
-     WHERE s.exam_id = e.exam_id) AS graded_count,
-  -- Needs review: not teacher-approved and below the threshold stored with the grade.
-  (SELECT COUNT(*) FROM question_evaluations qe
-     JOIN scripts s ON s.script_id = qe.script_id
-     WHERE s.exam_id = e.exam_id AND qe.status != 'teacher_approved'
-       AND qe.confidence < qe.threshold_used) AS review_count
-FROM exams e
+    select e.id as exam_id, e.name, e.review_threshold as review_confidence_threshold,
+           e.mark_step, e.created_at, e.updated_at,
+           (select count(*) from scripts s where s.exam_id = e.id)::int as script_count,
+           (select count(*) from scripts s
+             where s.exam_id = e.id and s.status = 'processed')::int as processed_count,
+           (select count(*) from scripts s
+             where s.exam_id = e.id and s.status = 'error')::int as error_count,
+           (select count(distinct ev.script_id) from evaluations ev
+              join scripts s on s.id = ev.script_id
+             where s.exam_id = e.id)::int as graded_count,
+           (select count(*) from evaluation_state es
+              join scripts s on s.id = es.script_id
+             where s.exam_id = e.id and es.needs_review)::int as review_count,
+           (select count(*) from exam_questions q where q.exam_id = e.id)::int as question_count,
+           (select coalesce(sum(q.max_marks), 0) from exam_questions q
+             where q.exam_id = e.id) as total_marks,
+           (exists (select 1 from exam_questions q where q.exam_id = e.id)
+            and not exists (select 1 from exam_questions q
+                             where q.exam_id = e.id and btrim(q.golden_answer) = ''))
+               as answer_key_complete
+    from exams e
 """
+
+
+def _optional_uuid(value: Any, what: str) -> UUID | None:
+    if value in (None, ""):
+        return None
+    parsed = as_uuid(value)
+    if parsed is None:
+        raise ValueError(f"{what} is not a valid id: {value!r}")
+    return parsed
 
 
 class ExamRepository:
@@ -37,116 +63,134 @@ class ExamRepository:
     # ── Exams ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _normalized_questions(conn: Connection, exam_id: str) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            "SELECT * FROM exam_questions WHERE exam_id=? ORDER BY question_number", (exam_id,)
+    def _questions(conn: Connection, exam_id: UUID) -> list[dict[str, Any]]:
+        questions = conn.execute(
+            """
+            select q.id as row_id, q.question_id, q.question_number, q.question_text,
+                   q.question_type::text as question_type, q.golden_answer, q.max_marks,
+                   q.review_threshold as review_confidence_threshold, q.evaluator_config_id
+            from exam_questions q where q.exam_id = %s order by q.question_number
+            """,
+            (exam_id,),
         ).fetchall()
-        questions = []
-        for row in rows:
-            question = dict(row)
-            for key in ("question_row_id", "exam_id", "created_at", "updated_at"):
-                question.pop(key, None)
-            criteria = conn.execute(
-                "SELECT name, description, max_marks AS marks, expected_concepts, guidance "
-                "FROM rubric_criteria WHERE question_row_id=? ORDER BY display_order",
-                (row["question_row_id"],),
-            ).fetchall()
-            question["criteria"] = [
-                {**dict(c), "expected_concepts": json.loads(c["expected_concepts"] or "[]")}
-                for c in criteria
-            ]
-            options = conn.execute(
-                "SELECT option_key, option_text, is_correct, display_order "
-                "FROM question_options WHERE question_row_id=? ORDER BY display_order",
-                (row["question_row_id"],),
-            ).fetchall()
-            question["options"] = [
-                {**dict(o), "is_correct": bool(o["is_correct"])} for o in options
-            ]
-            questions.append(question)
-        return questions
+        criteria: dict[str, list[dict[str, Any]]] = {}
+        for c in conn.execute(
+            """
+            select rc.exam_question_id, rc.name, rc.description, rc.max_marks as marks,
+                   rc.expected_concepts, rc.guidance
+            from rubric_criteria rc join exam_questions q on q.id = rc.exam_question_id
+            where q.exam_id = %s order by rc.display_order
+            """,
+            (exam_id,),
+        ):
+            criteria.setdefault(c.pop("exam_question_id"), []).append(c)
+        options: dict[str, list[dict[str, Any]]] = {}
+        for o in conn.execute(
+            """
+            select qo.exam_question_id, qo.option_key, qo.option_text, qo.is_correct,
+                   qo.display_order
+            from question_options qo join exam_questions q on q.id = qo.exam_question_id
+            where q.exam_id = %s order by qo.display_order
+            """,
+            (exam_id,),
+        ):
+            options.setdefault(o.pop("exam_question_id"), []).append(o)
+        for question in questions:
+            row_id = question.pop("row_id")
+            question["criteria"] = criteria.get(row_id, [])
+            question["options"] = options.get(row_id, [])
+        return list(questions)
 
     def _summarize(
-        self, row: sqlite3.Row, conn: Connection, include_questions: bool
+        self, row: dict[str, Any], conn: Connection, include_questions: bool
     ) -> dict[str, Any]:
-        d = dict(row)
-        d["review_confidence_threshold"] = ReviewPolicy.clamp(
-            d.get("review_confidence_threshold", ReviewPolicy.DEFAULT_THRESHOLD)
-        )
-        questions = self._normalized_questions(conn, d["exam_id"])
-        d.pop("config_json", None)
-        d["question_count"] = len(questions)
-        d["total_marks"] = round(sum(q.get("max_marks", 0) for q in questions), 2)
-        d["answer_key_complete"] = bool(questions) and all(
-            (q.get("golden_answer") or "").strip() for q in questions
-        )
+        row["review_confidence_threshold"] = ReviewPolicy.clamp(row["review_confidence_threshold"])
+        row["total_marks"] = round(row["total_marks"], 2)
         if include_questions:
-            d["questions"] = questions
-        return d
+            row["questions"] = self._questions(conn, UUID(row["exam_id"]))
+        return row
 
     def create(self, name: str) -> dict[str, Any]:
-        exam_id = uuid4().hex
         with self.db.use() as c:
-            c.execute("INSERT INTO exams(exam_id, name) VALUES (?, ?)", (exam_id, name.strip()))
-            return self.get(exam_id, c)  # type: ignore[return-value]
+            created = returned(
+                c.execute(
+                    "insert into exams (name) values (%s) returning id", (name.strip(),)
+                ).fetchone()
+            )
+            return returned(self.get(created["id"], c))
 
     def get(self, exam_id: str, conn: Connection | None = None) -> dict[str, Any] | None:
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return None
         with self.db.use(conn) as c:
-            row = c.execute(_SUMMARY_SQL + " WHERE e.exam_id = ?", (exam_id,)).fetchone()
+            row = c.execute(_SUMMARY_SQL + " where e.id = %s", (exam_uuid,)).fetchone()
             return self._summarize(row, c, include_questions=True) if row else None
 
     def list_all(self) -> list[dict[str, Any]]:
         with self.db.use() as c:
-            rows = c.execute(_SUMMARY_SQL + " ORDER BY e.created_at DESC").fetchall()
+            rows = c.execute(_SUMMARY_SQL + " order by e.created_at desc").fetchall()
             return [self._summarize(r, c, include_questions=False) for r in rows]
 
     def find_by_name(self, name: str) -> dict[str, Any] | None:
-        for exam in self.list_all():
-            if exam["name"] == name:
-                return exam
-        return None
+        with self.db.use() as c:
+            row = c.execute(
+                "select id from exams where name = %s order by created_at limit 1", (name,)
+            ).fetchone()
+            return self.get(row["id"], c) if row else None
 
     @staticmethod
-    def _replace_questions(conn: Connection, exam_id: str, questions: list[dict[str, Any]]) -> None:
-        conn.execute("DELETE FROM exam_questions WHERE exam_id=?", (exam_id,))
+    def _save_questions(conn: Connection, exam_id: UUID, questions: list[dict[str, Any]]) -> None:
+        keep: list[str] = []
         for number, question in enumerate(questions, start=1):
-            question_row_id = uuid4().hex
-            conn.execute(
-                """
-                INSERT INTO exam_questions
-                    (question_row_id, exam_id, question_id, question_number, question_text,
-                     question_type, golden_answer, max_marks, review_confidence_threshold,
-                     evaluator_config_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            keep.append(question["question_id"])
+            saved = returned(
+                conn.execute(
+                    """
+                insert into exam_questions
+                    (exam_id, question_id, question_number, question_type, question_text,
+                     golden_answer, max_marks, review_threshold, evaluator_config_id)
+                values (%s, %s, %s, %s::question_type, %s, %s, %s, %s, %s)
+                on conflict (exam_id, question_id) do update set
+                    question_number     = excluded.question_number,
+                    question_type       = excluded.question_type,
+                    question_text       = excluded.question_text,
+                    golden_answer       = excluded.golden_answer,
+                    max_marks           = excluded.max_marks,
+                    review_threshold    = excluded.review_threshold,
+                    evaluator_config_id = excluded.evaluator_config_id
+                returning id
                 """,
-                (
-                    question_row_id,
-                    exam_id,
-                    question["question_id"],
-                    number,
-                    question.get("question_text", ""),
-                    question["question_type"],
-                    question.get("golden_answer", ""),
-                    question["max_marks"],
-                    question.get("review_confidence_threshold"),
-                    question.get("evaluator_config_id"),
-                ),
+                    (
+                        exam_id,
+                        question["question_id"],
+                        number,
+                        question["question_type"],
+                        question.get("question_text", ""),
+                        question.get("golden_answer", ""),
+                        question["max_marks"],
+                        question.get("review_confidence_threshold"),
+                        _optional_uuid(question.get("evaluator_config_id"), "evaluator_config_id"),
+                    ),
+                ).fetchone()
             )
+            row_id = saved["id"]
+            conn.execute("delete from rubric_criteria where exam_question_id = %s", (row_id,))
+            conn.execute("delete from question_options where exam_question_id = %s", (row_id,))
             for index, criterion in enumerate(question.get("criteria", [])):
                 conn.execute(
                     """
-                    INSERT INTO rubric_criteria
-                        (criterion_id, question_row_id, name, description, max_marks,
-                         expected_concepts, guidance, display_order)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    insert into rubric_criteria
+                        (exam_question_id, name, description, max_marks, expected_concepts,
+                         guidance, display_order)
+                    values (%s, %s, %s, %s, %s::text[], %s, %s)
                     """,
                     (
-                        uuid4().hex,
-                        question_row_id,
+                        row_id,
                         criterion["name"],
                         criterion.get("description", ""),
                         criterion["marks"],
-                        json.dumps(criterion.get("expected_concepts", [])),
+                        criterion.get("expected_concepts", []),
                         criterion.get("guidance", ""),
                         index,
                     ),
@@ -154,52 +198,21 @@ class ExamRepository:
             for index, option in enumerate(question.get("options", [])):
                 conn.execute(
                     """
-                    INSERT INTO question_options
-                        (option_id, question_row_id, option_key, option_text, is_correct,
-                         display_order)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    insert into question_options
+                        (exam_question_id, option_key, option_text, is_correct, display_order)
+                    values (%s, %s, %s, %s, %s)
                     """,
                     (
-                        uuid4().hex,
-                        question_row_id,
+                        row_id,
                         option["option_key"],
                         option["option_text"],
-                        int(option.get("is_correct", False)),
+                        bool(option.get("is_correct", False)),
                         option.get("display_order", index),
                     ),
                 )
-
-    @staticmethod
-    def _sync_evaluation_thresholds(conn: Connection, exam_id: str, exam_threshold: float) -> None:
-        """Point every stored grade at the threshold now configured for it (the question's
-        own override, else the exam's), so changing a threshold takes effect without a
-        re-grade, and refresh each graded script's stored status to match."""
         conn.execute(
-            """
-            UPDATE question_evaluations SET threshold_used = COALESCE(
-                (SELECT q.review_confidence_threshold FROM exam_questions q
-                  JOIN scripts s ON s.exam_id = q.exam_id
-                 WHERE s.script_id = question_evaluations.script_id
-                   AND q.exam_id = ? AND q.question_id = question_evaluations.question_id),
-                ?)
-            WHERE script_id IN (SELECT script_id FROM scripts WHERE exam_id = ?)
-            """,
-            (exam_id, exam_threshold, exam_id),
-        )
-        conn.execute(
-            """
-            UPDATE scripts SET status = CASE
-                WHEN EXISTS (
-                    SELECT 1 FROM question_evaluations qe
-                    WHERE qe.script_id = scripts.script_id
-                      AND qe.status != 'teacher_approved' AND qe.confidence < qe.threshold_used
-                ) THEN 'needs_review' ELSE 'graded' END
-            WHERE exam_id = ?
-              AND status IN ('graded', 'needs_review')
-              AND EXISTS (SELECT 1 FROM question_evaluations qe
-                          WHERE qe.script_id = scripts.script_id)
-            """,
-            (exam_id,),
+            "delete from exam_questions where exam_id = %s and question_id <> all(%s::text[])",
+            (exam_id, keep),
         )
 
     def update(
@@ -208,86 +221,84 @@ class ExamRepository:
         name: str | None = None,
         questions: list[dict[str, Any]] | None = None,
         review_confidence_threshold: float | None = None,
+        mark_step: float | None = None,
     ) -> dict[str, Any] | None:
-        with self.db.use() as c:
-            exam = self.get(exam_id, c)
-            if not exam:
-                return None
-            threshold = (
-                ReviewPolicy.clamp(review_confidence_threshold)
-                if review_confidence_threshold is not None
-                else exam["review_confidence_threshold"]
-            )
-            kept_questions = questions if questions is not None else exam["questions"]
-            c.execute(
-                "UPDATE exams SET name=?, config_json=?, review_confidence_threshold=?, "
-                "updated_at=datetime('now') WHERE exam_id=?",
-                (
-                    name.strip() if name is not None else exam["name"],
-                    json.dumps({"questions": kept_questions}),
-                    threshold,
-                    exam_id,
-                ),
-            )
-            if questions is not None:
-                self._replace_questions(c, exam_id, questions)
-            if questions is not None or review_confidence_threshold is not None:
-                self._sync_evaluation_thresholds(c, exam_id, threshold)
-            return self.get(exam_id, c)
+        """Rename an exam, change its review threshold or mark step, and/or replace its answer
+        key. Raises ValueError for an unknown evaluator config."""
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return None
+        try:
+            with self.db.use() as c:
+                exam = self.get(exam_id, c)
+                if not exam:
+                    return None
+                threshold = (
+                    ReviewPolicy.clamp(review_confidence_threshold)
+                    if review_confidence_threshold is not None
+                    else exam["review_confidence_threshold"]
+                )
+                c.execute(
+                    "update exams set name = %s, review_threshold = %s, mark_step = %s "
+                    "where id = %s",
+                    (
+                        name.strip() if name is not None else exam["name"],
+                        threshold,
+                        mark_step if mark_step is not None else exam["mark_step"],
+                        exam_uuid,
+                    ),
+                )
+                if questions is not None:
+                    self._save_questions(c, exam_uuid, questions)
+                return self.get(exam_id, c)
+        except psycopg.errors.ForeignKeyViolation as exc:
+            raise ValueError(
+                "A question refers to an evaluator config that does not exist"
+            ) from exc
 
     def delete(self, exam_id: str) -> list[str] | None:
-        """Delete an exam and everything under it.
-
-        scripts.exam_id has no ON DELETE CASCADE (it was added by a later migration), so
-        scripts are removed first; that cascades to their extractions and evaluations. Jobs
-        cascade from the exam row. Returns the deleted script ids (so their files can be
-        removed), or None if the exam didn't exist.
-        """
+        """Delete an exam and everything under it (scripts, extractions, grades, jobs cascade).
+        Returns the deleted script ids so their files can be removed, or None if the exam
+        didn't exist."""
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return None
         with self.db.use() as c:
-            if not self.get(exam_id, c):
+            if c.execute("select 1 from exams where id = %s", (exam_uuid,)).fetchone() is None:
                 return None
             script_ids = [
-                r["script_id"]
-                for r in c.execute("SELECT script_id FROM scripts WHERE exam_id = ?", (exam_id,))
+                r["id"]
+                for r in c.execute("select id from scripts where exam_id = %s", (exam_uuid,))
             ]
-            c.execute("DELETE FROM scripts WHERE exam_id = ?", (exam_id,))
-            c.execute("DELETE FROM exams WHERE exam_id = ?", (exam_id,))
+            c.execute("delete from exams where id = %s", (exam_uuid,))
             return script_ids
 
     # ── Scripts and results within an exam ───────────────────────────────────
 
     def scripts(self, exam_id: str, conn: Connection | None = None) -> list[dict[str, Any]]:
+        """Every script in the exam with its pipeline/grading status and totals. The status is
+        derived by the script_summary view: graded and needs-review are never stored, so they
+        cannot go stale when a teacher approves answers or a threshold changes."""
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return []
         with self.db.use(conn) as c:
-            rows = c.execute(
-                """
-                SELECT sc.script_id, sc.student_id, sc.filename, sc.status, sc.page_count,
-                       sc.error, sc.created_at, st.name AS student_name,
-                       COUNT(qe.eval_id) AS graded_questions,
-                       COALESCE(SUM(qe.awarded_marks), 0) AS total_awarded,
-                       COALESCE(SUM(qe.max_marks), 0) AS total_max,
-                       COALESCE(SUM(CASE WHEN qe.status != 'teacher_approved'
-                                          AND qe.confidence < qe.threshold_used
-                                         THEN 1 ELSE 0 END), 0) AS needs_review_count,
-                       (SELECT COUNT(*) FROM question_extractions x
-                        WHERE x.script_id = sc.script_id) AS extraction_count
-                FROM scripts sc
-                LEFT JOIN students st ON st.student_id = sc.student_id
-                LEFT JOIN question_evaluations qe ON qe.script_id = sc.script_id
-                WHERE sc.exam_id = ?
-                GROUP BY sc.script_id, st.name
-                ORDER BY st.name COLLATE NOCASE, sc.created_at
-                """,
-                (exam_id,),
-            ).fetchall()
-        scripts = []
-        for r in rows:
-            d = dict(r)
-            # The stored status goes stale once the teacher approves flagged answers, so
-            # derive it from the evaluations for anything that has been graded.
-            if d["graded_questions"] > 0 and d["status"] not in ("processing", "error"):
-                d["status"] = "needs_review" if d["needs_review_count"] > 0 else "graded"
-            scripts.append(d)
-        return scripts
+            return list(
+                c.execute(
+                    """
+                    select ss.script_id, st.external_id as student_id, ss.filename, ss.status,
+                           ss.page_count, ss.error, ss.created_at, st.name as student_name,
+                           ss.graded_questions, ss.total_awarded, ss.total_max,
+                           ss.needs_review_count,
+                           (select count(*) from extractions x
+                             where x.script_id = ss.script_id)::int as extraction_count
+                    from script_summary ss join students st on st.id = ss.student_id
+                    where ss.exam_id = %s
+                    order by lower(st.name), ss.created_at
+                    """,
+                    (exam_uuid,),
+                ).fetchall()
+            )
 
     def results(self, exam: dict[str, Any]) -> dict[str, Any]:
         """Student x question grid with totals, ready for the results table and CSV."""
@@ -295,30 +306,30 @@ class ExamRepository:
         question_ids = [q["question_id"] for q in questions]
         max_by_question = {q["question_id"]: q["max_marks"] for q in questions}
         total_max = round(sum(max_by_question.values()), 2)
-        exam_threshold = exam.get("review_confidence_threshold", ReviewPolicy.DEFAULT_THRESHOLD)
 
         marks_by_script: dict[str, dict[str, dict[str, Any]]] = {}
         with self.db.use() as c:
             evaluation_rows = c.execute(
                 """
-                SELECT qe.script_id, qe.question_id, qe.awarded_marks, qe.max_marks,
-                       qe.status, qe.confidence, qe.threshold_used
-                FROM question_evaluations qe
-                JOIN scripts s ON s.script_id = qe.script_id
-                WHERE s.exam_id = ?
+                select es.script_id, q.question_id, es.final_marks as awarded,
+                       es.max_marks as max, es.confidence,
+                       case when es.review_status = 'teacher_approved' then 'teacher_approved'
+                            when es.needs_review then 'needs_review'
+                            else 'scored' end as status
+                from evaluation_state es
+                join scripts s on s.id = es.script_id
+                join exam_questions q on q.id = es.exam_question_id
+                where s.exam_id = %s
                 """,
-                (exam["exam_id"],),
+                (UUID(exam["exam_id"]),),
             ).fetchall()
             script_rows = self.scripts(exam["exam_id"], c)
 
         for r in evaluation_rows:
-            if r["question_id"] not in max_by_question:  # question removed from the key
-                continue
-            policy = ReviewPolicy(r["threshold_used"] or exam_threshold)
             marks_by_script.setdefault(r["script_id"], {})[r["question_id"]] = {
-                "awarded": r["awarded_marks"],
-                "max": r["max_marks"],
-                "status": policy.effective_status(r["status"], r["confidence"]),
+                "awarded": r["awarded"],
+                "max": r["max"],
+                "status": r["status"],
                 "confidence": r["confidence"],
             }
 
@@ -354,30 +365,11 @@ class ExamRepository:
             "rows": rows,
         }
 
-    def refresh_script_status(self, script_id: str) -> None:
-        """Set a graded script's stored status from its evaluations."""
-        with self.db.use() as c:
-            row = c.execute(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN status != 'teacher_approved' "
-                "AND confidence < threshold_used THEN 1 ELSE 0 END), 0) AS pending "
-                "FROM question_evaluations WHERE script_id=?",
-                (script_id,),
-            ).fetchone()
-            if row["n"]:
-                status = "needs_review" if row["pending"] else "graded"
-                c.execute("UPDATE scripts SET status=? WHERE script_id=?", (status, script_id))
 
-    def threshold_for_script(self, script_id: str) -> float:
-        """The review threshold of the exam a script belongs to."""
-        with self.db.use() as c:
-            row = c.execute(
-                "SELECT e.review_confidence_threshold AS t FROM scripts s "
-                "LEFT JOIN exams e ON e.exam_id = s.exam_id WHERE s.script_id = ?",
-                (script_id,),
-            ).fetchone()
-        if row and row["t"] is not None:
-            return ReviewPolicy.clamp(row["t"])
-        return ReviewPolicy.DEFAULT_THRESHOLD
+_EVALUATOR_COLUMNS = (
+    "id as evaluator_config_id, name, kind::text as evaluator_kind, provider_name, model_name, "
+    "temperature, max_tokens, fallback_config_id, created_at, updated_at"
+)
 
 
 class EvaluatorConfigRepository:
@@ -385,122 +377,146 @@ class EvaluatorConfigRepository:
         self.db = db
 
     def create(self, config: dict[str, Any]) -> dict[str, Any]:
-        config_id = uuid4().hex
-        with self.db.use() as c:
-            c.execute(
-                """
-                INSERT INTO evaluator_configs
-                    (evaluator_config_id, name, evaluator_kind, provider_name, model_name,
-                     temperature, max_tokens, fallback_config_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    config_id,
-                    config["name"].strip(),
-                    config["evaluator_kind"],
-                    config["provider_name"].strip(),
-                    config["model_name"].strip(),
-                    config.get("temperature", 0.0),
-                    config.get("max_tokens"),
-                    config.get("fallback_config_id"),
-                ),
-            )
-            return dict(
-                c.execute(
-                    "SELECT * FROM evaluator_configs WHERE evaluator_config_id=?", (config_id,)
+        """Raises ValueError when fallback_config_id isn't a real config."""
+        try:
+            with self.db.use() as c:
+                row = c.execute(
+                    f"""
+                    insert into evaluator_configs
+                        (name, kind, provider_name, model_name, temperature, max_tokens,
+                         fallback_config_id)
+                    values (%s, %s::grader_kind, %s, %s, %s, %s, %s)
+                    returning {_EVALUATOR_COLUMNS}
+                    """,  # noqa: S608 - the column list is a constant
+                    (
+                        config["name"].strip(),
+                        config["evaluator_kind"],
+                        config["provider_name"].strip(),
+                        config["model_name"].strip(),
+                        config.get("temperature", 0.0),
+                        config.get("max_tokens"),
+                        _optional_uuid(config.get("fallback_config_id"), "fallback_config_id"),
+                    ),
                 ).fetchone()
-            )
+        except psycopg.errors.ForeignKeyViolation as exc:
+            raise ValueError("fallback_config_id does not match an existing config") from exc
+        return returned(row)
 
     def list_all(self) -> list[dict[str, Any]]:
         with self.db.use() as c:
-            return [
-                dict(r)
-                for r in c.execute(
-                    "SELECT * FROM evaluator_configs ORDER BY name COLLATE NOCASE"
+            return list(
+                c.execute(
+                    f"select {_EVALUATOR_COLUMNS} from evaluator_configs order by lower(name)"  # noqa: S608
                 ).fetchall()
-            ]
+            )
 
     def get(self, config_id: str) -> dict[str, Any] | None:
+        config_uuid = as_uuid(config_id)
+        if config_uuid is None:
+            return None
         with self.db.use() as c:
-            row = c.execute(
-                "SELECT * FROM evaluator_configs WHERE evaluator_config_id=?", (config_id,)
+            return c.execute(
+                f"select {_EVALUATOR_COLUMNS} from evaluator_configs where id = %s",  # noqa: S608
+                (config_uuid,),
             ).fetchone()
-            return dict(row) if row else None
+
+
+_JOB_COLUMNS = (
+    "id as job_id, exam_id, kind::text as kind, status::text as status, total, done, message, "
+    "error, cancel_requested, heartbeat_at, started_at, finished_at, created_at, updated_at"
+)
 
 
 class JobRepository:
-    """Background work (processing / grading a whole exam) with progress."""
+    """Background work (processing / grading a whole exam) with progress. The database allows
+    at most one queued-or-running job per exam, so a second start raises JobConflict even when
+    two requests race."""
 
     _FIELDS = frozenset({"status", "total", "done", "message", "error"})
 
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    @staticmethod
-    def _job(row: Any) -> dict[str, Any] | None:
-        if not row:
-            return None
-        d = dict(row)
-        d["cancel_requested"] = bool(d["cancel_requested"])
-        return d
-
     def create(self, exam_id: str, kind: str, total: int) -> dict[str, Any]:
-        job_id = uuid4().hex
-        with self.db.use() as c:
-            c.execute(
-                "INSERT INTO jobs(job_id, exam_id, kind, total) VALUES (?, ?, ?, ?)",
-                (job_id, exam_id, kind, total),
-            )
-            return self._job(c.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())  # type: ignore[return-value]
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            raise LookupError("Exam not found")
+        try:
+            with self.db.use() as c:
+                row = c.execute(
+                    f"insert into jobs (exam_id, kind, total) "  # noqa: S608
+                    f"values (%s, %s::job_kind, %s) returning {_JOB_COLUMNS}",
+                    (exam_uuid, kind, total),
+                ).fetchone()
+        except psycopg.errors.UniqueViolation as exc:
+            raise JobConflict("Another job is already running for this exam.") from exc
+        except psycopg.errors.ForeignKeyViolation as exc:
+            raise LookupError("Exam not found") from exc
+        return returned(row)
 
     def active(self, exam_id: str, conn: Connection | None = None) -> dict[str, Any] | None:
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return None
         with self.db.use(conn) as c:
-            return self._job(
-                c.execute(
-                    "SELECT * FROM jobs WHERE exam_id=? AND status IN ('queued', 'running') "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (exam_id,),
-                ).fetchone()
-            )
-
-    _LATEST_SQLITE = (
-        "SELECT * FROM jobs WHERE exam_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1"
-    )
-    _LATEST_POSTGRES = (
-        "SELECT * FROM jobs WHERE exam_id=? ORDER BY created_at DESC, job_id DESC LIMIT 1"
-    )
+            return c.execute(
+                f"select {_JOB_COLUMNS} from jobs "  # noqa: S608
+                "where exam_id = %s and status in ('queued', 'running') limit 1",
+                (exam_uuid,),
+            ).fetchone()
 
     def latest(self, exam_id: str) -> dict[str, Any] | None:
-        # SQLite timestamps only have one-second resolution, so insertion order (rowid) breaks
-        # ties; PostgreSQL has no rowid but its timestamps have microseconds.
-        query = self._LATEST_POSTGRES if self.db.is_postgres else self._LATEST_SQLITE
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return None
         with self.db.use() as c:
-            return self._job(c.execute(query, (exam_id,)).fetchone())
+            return c.execute(
+                f"select {_JOB_COLUMNS} from jobs where exam_id = %s "  # noqa: S608
+                "order by created_at desc, id desc limit 1",
+                (exam_uuid,),
+            ).fetchone()
 
     def update(self, job_id: str, **fields: Any) -> None:
+        """Update progress. Every call is also a heartbeat; entering 'running' stamps
+        started_at and a terminal status stamps finished_at."""
+        job_uuid = as_uuid(job_id)
         sets = {k: v for k, v in fields.items() if k in self._FIELDS}
-        if not sets:
+        if job_uuid is None or not sets:
             return
-        assignments = ", ".join(f"{k}=?" for k in sets)  # keys are whitelisted above
+        assignments = [  # keys are whitelisted above
+            f"{key} = %s::job_status" if key == "status" else f"{key} = %s" for key in sets
+        ]
+        assignments.append("heartbeat_at = now()")
+        status = sets.get("status")
+        if status == "running":
+            assignments.append("started_at = coalesce(started_at, now())")
+        elif status in ("done", "failed", "cancelled"):
+            assignments.append("finished_at = now()")
         with self.db.use() as c:
             c.execute(
-                f"UPDATE jobs SET {assignments}, updated_at=datetime('now') WHERE job_id=?",  # noqa: S608
-                (*sets.values(), job_id),
+                f"update jobs set {', '.join(assignments)} where id = %s",  # noqa: S608
+                (*sets.values(), job_uuid),
             )
 
     def request_cancel(self, exam_id: str) -> bool:
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return False
         with self.db.use() as c:
-            cur = c.execute(
-                "UPDATE jobs SET cancel_requested=1, updated_at=datetime('now') "
-                "WHERE exam_id=? AND status IN ('queued', 'running')",
-                (exam_id,),
+            cursor = c.execute(
+                "update jobs set cancel_requested = true "
+                "where exam_id = %s and status in ('queued', 'running')",
+                (exam_uuid,),
             )
-            return bool(cur.rowcount > 0)
+            return bool(cursor.rowcount > 0)
 
     def is_cancel_requested(self, job_id: str) -> bool:
+        job_uuid = as_uuid(job_id)
+        if job_uuid is None:
+            return False
         with self.db.use() as c:
             row = c.execute(
-                "SELECT cancel_requested FROM jobs WHERE job_id=?", (job_id,)
+                "select cancel_requested from jobs where id = %s", (job_uuid,)
             ).fetchone()
         return bool(row and row["cancel_requested"])
 
@@ -508,6 +524,6 @@ class JobRepository:
         """Jobs left 'running' by a server restart can never finish; close them out."""
         with self.db.use() as c:
             c.execute(
-                "UPDATE jobs SET status='failed', error='Interrupted by a server restart', "
-                "updated_at=datetime('now') WHERE status IN ('queued', 'running')"
+                "update jobs set status = 'failed', error = 'Interrupted by a server restart', "
+                "finished_at = now() where status in ('queued', 'running')"
             )

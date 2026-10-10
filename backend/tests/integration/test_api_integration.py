@@ -1,5 +1,8 @@
 """
-API integration tests for RubricTrace routes.
+API integration tests for RubricTrace routes, run against a live server on localhost:8000.
+
+They skip when no server is up. The in-process flow tests (test_exam_flow.py) cover the real
+behaviour; these only smoke-test a running deployment.
 """
 
 import pytest
@@ -47,38 +50,3 @@ def test_review_queue():
     data = res.json()
     assert "total" in data
     assert isinstance(data["items"], list)
-
-
-@server_available
-def test_rubric_configs_crud():
-    # Create
-    cfg_payload = {
-        "name": "Integration Test Rubric",
-        "config": {
-            "questions": [
-                {
-                    "question_id": "Q1",
-                    "golden_answer": "Test answer",
-                    "max_marks": 5,
-                    "criteria": [
-                        {
-                            "name": "Accuracy",
-                            "marks": 5,
-                            "expected_concepts": ["test"],
-                            "guidance": "",
-                        }
-                    ],
-                }
-            ]
-        },
-    }
-    create_res = requests.post(f"{BASE_URL}/rubric-configs", json=cfg_payload, timeout=TIMEOUT)
-    assert create_res.status_code == 200
-    config_id = create_res.json()["config_id"]
-
-    # Read
-    get_res = requests.get(f"{BASE_URL}/rubric-configs/{config_id}", timeout=TIMEOUT)
-    assert get_res.status_code == 200
-    data = get_res.json()
-    assert data["name"] == "Integration Test Rubric"
-    assert len(data["config"]["questions"]) == 1

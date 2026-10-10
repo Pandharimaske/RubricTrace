@@ -1,5 +1,6 @@
 """Student script upload, extraction, and script detail endpoints."""
 
+import hashlib
 import threading
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from uuid import uuid4
 from backend.app.api.deps import ContainerDep
 from backend.app.container import Container
 from backend.app.core.storage import UploadRejected
+from backend.app.db.repositories import ScriptConflict
 from backend.app.llm.errors import ModelUnavailable
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -46,9 +48,7 @@ def _render_pages(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if script.get("page_count") != len(pages):
-        c.scripts.set_status(
-            script["script_id"], script["status"], page_count=len(pages), error=script.get("error")
-        )
+        c.scripts.set_page_count(script["script_id"], len(pages))
     matches = _page_files(page_dir, page_number)
     if not matches:
         raise HTTPException(
@@ -63,9 +63,9 @@ async def upload_script(
     c: ContainerDep,
     student_id: str | None = Form(None),
     student_name: str | None = Form(None),
-    exam_id: str | None = Form(None),
+    exam_id: str = Form(...),
 ) -> dict[str, object]:
-    if exam_id and not c.exams.get(exam_id):
+    if not c.exams.get(exam_id):
         raise HTTPException(status_code=404, detail="Exam not found")
 
     # Reject oversize uploads before reading them into memory when the size is known.
@@ -82,8 +82,20 @@ async def upload_script(
 
     sid = (student_id or "").strip() or uuid4().hex
     name = (student_name or "").strip() or Path(file.filename or "").stem or sid
-    c.students.upsert(sid, name)
-    c.scripts.insert(stored.script_id, sid, file.filename or "script", str(stored.path), exam_id)
+    try:
+        c.scripts.insert(
+            stored.script_id,
+            sid,
+            file.filename or "script",
+            str(stored.path),
+            exam_id,
+            file_sha256=hashlib.sha256(content).hexdigest(),
+            student_name=name,
+        )
+    except (ScriptConflict, LookupError) as exc:
+        c.storage.delete(stored.script_id)  # nothing refers to the saved copy any more
+        status = 409 if isinstance(exc, ScriptConflict) else 404
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
     return {
         "script_id": stored.script_id,
         "student_id": sid,
@@ -103,7 +115,7 @@ def process_script(script_id: str, c: ContainerDep) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="Script not found")
     script_path = Path(script["file_path"])
     try:
-        processed = c.processor.process(script_id, script_path)
+        processed = c.processor.process(script["script_id"], script_path)
     except ModelUnavailable as exc:
         raise HTTPException(
             status_code=503, detail=f"VLM extraction is required and unavailable: {exc}"
@@ -146,7 +158,7 @@ def get_page_image(script_id: str, page_number: int, c: ContainerDep) -> FileRes
     script = c.scripts.get(script_id)
     if not script:
         raise HTTPException(status_code=404, detail="Script not found")
-    page_dir = c.config.page_image_dir / script_id
+    page_dir = c.config.page_image_dir / script["script_id"]
     # Scripts inserted straight into the database (e.g. the imported dataset) were never
     # rendered, so render them from the original file the first time a page is requested.
     # The lock is taken even to look: a page file seen mid-render may be half-written.

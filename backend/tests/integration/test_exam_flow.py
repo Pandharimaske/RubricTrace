@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 from backend.app.container import Container
+from backend.app.grading.evaluators import Evaluation
 from backend.app.main import create_app
+from backend.app.models.domain import QuestionSpec
 from fastapi.testclient import TestClient
 
 from conftest import FakeEngine
@@ -152,14 +154,30 @@ def test_regrading_never_overwrites_a_teacher_approved_mark(
     assert row["marks"]["Q2"]["awarded"] == 0.5
 
 
-def test_unsupported_and_empty_uploads_are_rejected(client: TestClient) -> None:
+def test_unsupported_and_empty_uploads_are_rejected(client: TestClient, exam_id: str) -> None:
     bad_type = client.post(
-        "/api/scripts/upload", files={"file": ("virus.exe", b"MZ", "application/octet-stream")}
+        "/api/scripts/upload",
+        files={"file": ("virus.exe", b"MZ", "application/octet-stream")},
+        data={"exam_id": exam_id},
     )
-    empty = client.post("/api/scripts/upload", files={"file": ("a.pdf", b"", "application/pdf")})
+    empty = client.post(
+        "/api/scripts/upload",
+        files={"file": ("a.pdf", b"", "application/pdf")},
+        data={"exam_id": exam_id},
+    )
 
     assert bad_type.status_code == 400
     assert empty.status_code == 400
+
+
+def test_an_upload_must_name_an_existing_exam(client: TestClient) -> None:
+    files = {"file": ("a.txt", b"Q1. B", "text/plain")}
+
+    assert client.post("/api/scripts/upload", files=files).status_code == 422
+    unknown = client.post(
+        "/api/scripts/upload", files=files, data={"exam_id": "00000000-0000-0000-0000-000000000000"}
+    )
+    assert unknown.status_code == 404
 
 
 def test_grading_requires_a_reference_answer_for_every_question(client: TestClient) -> None:
@@ -215,3 +233,116 @@ def test_confidence_equal_to_the_threshold_is_not_flagged(
     assert queue["total"] == 0
     assert row["needs_review_count"] == 0
     assert [e["status"] for e in script["evaluations"]] == ["scored"]
+
+
+def _upload_file(client: TestClient, exam_id: str, content: bytes, student_id: str) -> Any:
+    return client.post(
+        "/api/scripts/upload",
+        files={"file": (f"{student_id}.txt", content, "text/plain")},
+        data={"exam_id": exam_id, "student_id": student_id},
+    )
+
+
+def test_a_student_has_one_script_per_exam_and_a_rejected_upload_leaves_no_trace(
+    client: TestClient, exam_id: str, config: Any
+) -> None:
+    assert _upload_file(client, exam_id, b"Q1. B", "S1").status_code == 200
+
+    again = _upload_file(client, exam_id, b"Q1. A", "S1")
+
+    assert again.status_code == 409
+    assert len(client.get(f"/api/exams/{exam_id}/scripts").json()["scripts"]) == 1
+    assert len(list(config.upload_dir.iterdir())) == 1  # the rejected copy was removed
+
+
+def test_the_same_file_cannot_be_uploaded_twice_to_an_exam(
+    client: TestClient, exam_id: str
+) -> None:
+    assert _upload_file(client, exam_id, b"Q1. B", "S1").status_code == 200
+
+    duplicate = _upload_file(client, exam_id, b"Q1. B", "S2")
+
+    assert duplicate.status_code == 409
+    assert "already uploaded" in duplicate.json()["detail"]
+    assert [s["student_id"] for s in client.get("/api/students").json()["students"]] == ["S1"]
+
+
+def test_a_teacher_override_keeps_the_ai_mark_alongside_it(
+    client: TestClient, exam_id: str
+) -> None:
+    script = _upload(client, exam_id)
+    client.post(f"/api/exams/{exam_id}/process")
+    _wait_for_job(client, exam_id)
+    client.post(f"/api/exams/{exam_id}/grade")
+    _wait_for_job(client, exam_id)
+
+    client.post(
+        f"/api/scripts/{script['script_id']}/override",
+        json={"question_id": "Q2", "awarded_marks": 0.5, "reason": "too generous"},
+    )
+
+    detail = client.get(f"/api/scripts/{script['script_id']}").json()
+    q2 = {e["question_id"]: e for e in detail["evaluations"]}["Q2"]
+    assert q2["ai_marks"] == 2  # what the model awarded is never overwritten
+    assert q2["awarded_marks"] == 0.5
+    assert q2["teacher_override"] == 0.5
+    assert q2["teacher_override_reason"] == "too generous"
+
+
+class FixedMarksEngine(FakeEngine):
+    """Awards a fixed number of marks to descriptive answers at a fixed confidence."""
+
+    def __init__(self, marks: float, confidence: float = 0.99) -> None:
+        super().__init__(confidence=confidence)
+        self.marks = marks
+
+    def evaluate(self, spec: QuestionSpec, answer: str) -> Evaluation:
+        if spec.is_objective:
+            return super().evaluate(spec, answer)
+        return Evaluation(
+            awarded_marks=self.marks,
+            confidence=self.confidence,
+            reasoning="fixed",
+            model="fake-llm",
+            snapshot={"evaluator": "llm"},
+        )
+
+
+def _grade_short_answer_exam(client: TestClient, **settings: Any) -> str:
+    exam = client.post("/api/exams", json={"name": "Short"}).json()["exam_id"]
+    client.put(f"/api/exams/{exam}", json={"questions": [SHORT], **settings})
+    _upload_file(client, exam, b"Q2. Uses labeled data", "S1")
+    client.post(f"/api/exams/{exam}/process")
+    _wait_for_job(client, exam)
+    client.post(f"/api/exams/{exam}/grade", json={"regrade": True})
+    _wait_for_job(client, exam)
+    return str(exam)
+
+
+def test_a_written_answer_scored_zero_is_flagged_even_when_the_model_is_confident(
+    make_container: Callable[..., Container],
+) -> None:
+    with TestClient(create_app(make_container(FixedMarksEngine(marks=0.0)))) as client:
+        exam = _grade_short_answer_exam(client)
+
+        queue = client.get("/api/review-queue", params={"exam_id": exam}).json()
+
+    assert queue["total"] == 1
+    assert queue["items"][0]["confidence"] == 0.99
+    assert "non-blank answer" in queue["items"][0]["flag_reasons"][0]
+
+
+def test_descriptive_marks_snap_to_the_exams_mark_step(
+    make_container: Callable[..., Container],
+) -> None:
+    with TestClient(create_app(make_container(FixedMarksEngine(marks=1.4)))) as client:
+        exam = _grade_short_answer_exam(client)
+        whole = client.get(f"/api/exams/{exam}/results").json()["rows"][0]["marks"]["Q2"]
+
+        client.put(f"/api/exams/{exam}", json={"mark_step": 0.5})
+        client.post(f"/api/exams/{exam}/grade", json={"regrade": True})
+        _wait_for_job(client, exam)
+        half = client.get(f"/api/exams/{exam}/results").json()["rows"][0]["marks"]["Q2"]
+
+    assert whole["awarded"] == 1.0  # whole marks by default
+    assert half["awarded"] == 1.5

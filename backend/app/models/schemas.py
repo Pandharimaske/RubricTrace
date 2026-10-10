@@ -94,11 +94,6 @@ class EvaluatorConfigCreate(BaseModel):
     fallback_config_id: str | None = None
 
 
-class TeacherEvaluationRequest(BaseModel):
-    script_id: str
-    questions: list[QuestionGradingConfig]
-
-
 class TeacherOverrideRequest(BaseModel):
     question_id: str
     awarded_marks: float = Field(ge=0)
@@ -117,6 +112,8 @@ class ExamUpdate(BaseModel):
     # Answers whose grading confidence is below this are flagged for teacher review.
     # Applied when reading, so changing it never needs a re-grade.
     review_confidence_threshold: float | None = Field(default=None, ge=0.05, le=1.0)
+    # Descriptive answers are graded in multiples of this (1 = whole marks, 0.5 = half marks).
+    mark_step: float | None = Field(default=None, gt=0, le=10)
 
     @model_validator(mode="before")
     @classmethod

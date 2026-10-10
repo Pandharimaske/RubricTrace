@@ -82,8 +82,10 @@ class ScriptProcessor:
         }
         by_id = {str(q["question_id"]): q for q in definitions}
 
+        detected: set[str] = set()
         for raw_qid, answer_text in reading.questions.items():
             qid = self._normalize_id(raw_qid)
+            detected.add(qid)
             exam_question = by_id.get(qid, {})
             confidence = reading.question_confidences.get(qid) or reading.question_confidences.get(
                 str(raw_qid)
@@ -101,18 +103,30 @@ class ScriptProcessor:
                 )
             if unreadable:
                 reasons.append("The answer could not be read reliably from the page image.")
+            page = reading.question_pages.get(qid) or reading.question_pages.get(raw_qid)
             self.extractions.upsert(
                 script_id,
                 qid,
                 answer_text,
-                reading.method,
-                page_number=reading.question_pages.get(qid) or reading.question_pages.get(raw_qid),
+                page_numbers=[page] if page else [],
                 question_number=int("".join(ch for ch in qid if ch.isdigit()) or 0),
-                question_type=exam_question.get("question_type", "unknown"),
-                extraction_confidence=confidence,
-                needs_review=low_confidence or unreadable,
-                review_reason=" ".join(reasons),
+                confidence=confidence,
+                model=reading.vlm_model or reading.method,
+                flags=reasons,
             )
+
+        # An exam question the model never found on any page is recorded as such, so grading
+        # and the review screens can tell "not found" from "found but blank".
+        for number, qid in enumerate(exam_question_ids, start=1):
+            if qid not in detected:
+                self.extractions.upsert(
+                    script_id,
+                    qid,
+                    "",
+                    question_number=number,
+                    model=reading.vlm_model or reading.method,
+                    answer_state="not_found",
+                )
 
         flagged = [c for c in reading.conflicts if c.get("kind") != "illegible"]
         if flagged:

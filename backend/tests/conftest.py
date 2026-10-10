@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import psycopg
 import pytest
 from backend.app.container import Container
 from backend.app.core.config import Settings
@@ -50,23 +51,25 @@ def config(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-def database(config: Settings) -> Iterator[Database]:
-    """SQLite in the temp dir by default. Set RUBRICTRACE_TEST_DATABASE_URL to a PostgreSQL URL
-    to run the same tests against PostgreSQL, each in its own throwaway schema."""
+def database() -> Iterator[Database]:
+    """A PostgreSQL schema created for this test, with the real migrations applied, dropped
+    afterwards. Set RUBRICTRACE_TEST_DATABASE_URL (a local container or a scratch Supabase
+    project); tests that need a database are skipped without it."""
     url = os.environ.get("RUBRICTRACE_TEST_DATABASE_URL", "")
     if not url:
-        yield Database(sqlite_path=config.db_path)
-        return
-
-    import psycopg
+        pytest.skip("set RUBRICTRACE_TEST_DATABASE_URL to run the database tests")
 
     schema = f"t_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(url, autocommit=True) as admin:
-        admin.execute(f"CREATE SCHEMA {schema}")
-    separator = "&" if "?" in url else "?"
-    yield Database(url=f"{url}{separator}options=-csearch_path%3D{schema}")
-    with psycopg.connect(url, autocommit=True) as admin:
-        admin.execute(f"DROP SCHEMA {schema} CASCADE")
+        admin.execute(f"create schema {schema}")
+    db = Database(url, schema=schema, max_connections=4)
+    try:
+        db.migrate()
+        yield db
+    finally:
+        db.close()
+        with psycopg.connect(url, autocommit=True) as admin:
+            admin.execute(f"drop schema {schema} cascade")
 
 
 @pytest.fixture

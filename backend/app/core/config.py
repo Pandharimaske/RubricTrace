@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     )
 
     # --- Storage / database ---
-    # Where uploads, page images, caches and the SQLite file live (default: backend/data).
+    # Where uploads, page images and caches live (default: backend/data).
     data_root: Path | None = None
     storage_backend: str = "local"
     storage_endpoint_url: str = ""
@@ -46,7 +46,10 @@ class Settings(BaseSettings):
     storage_secret_key: str = ""
     storage_bucket: str = "rubrictrace"
     storage_region: str = "us-east-1"
+    # PostgreSQL connection string (Supabase pooler or direct). Required: there is no local
+    # database fallback. The schema comes from supabase/migrations/.
     database_url: str = ""
+    db_pool_max: int = 10
 
     supabase_url: str = Field(default="", validation_alias="SUPABASE_URL")
     supabase_service_key: str = Field(default="", validation_alias="SUPABASE_SERVICE_KEY")
@@ -82,10 +85,6 @@ class Settings(BaseSettings):
     @property
     def data_dir(self) -> Path:
         return self.data_root or BACKEND_ROOT / "data"
-
-    @property
-    def db_path(self) -> Path:
-        return self.data_dir / "rubrictrace.db"
 
     @property
     def raw_dir(self) -> Path:

@@ -19,7 +19,7 @@ dependencies = [
     "pymupdf>=1.25",
     "python-dotenv>=1.0",
     "boto3>=1.35",
-    "psycopg[binary]>=3.2",
+    "psycopg[binary,pool]>=3.2",
     "openai>=3.24.0",
 ]
 
@@ -89,7 +89,7 @@ pythonpath = [".."]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
 markers = [
-    "integration: needs external services (Postgres, Temporal); run in CI or via `just test-integration`",
+    "integration: needs external services",
 ]
 
 [tool.coverage.run]

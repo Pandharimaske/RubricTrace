@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from backend.app.db.exams import ExamRepository, JobRepository
+from backend.app.db.exams import ExamRepository, JobConflict, JobRepository
 from backend.app.db.repositories import (
     EvaluationRepository,
     ExtractionRepository,
@@ -24,9 +24,7 @@ from backend.app.models.domain import QuestionSpec
 
 log = logging.getLogger(__name__)
 
-
-class JobConflict(RuntimeError):
-    """A job is already running for this exam."""
+__all__ = ["JobConflict", "JobRunner", "NothingToDo", "SetupRequired"]
 
 
 class SetupRequired(ValueError):
@@ -82,7 +80,7 @@ class JobRunner:
             raise NothingToDo("No scripts are waiting to be processed.")
 
         question_ids = [q["question_id"] for q in exam["questions"]]
-        job = self.jobs.create(exam_id, "process", total=len(script_ids))
+        job = self.jobs.create(exam_id, "process", total=len(script_ids))  # may raise JobConflict
         self._executor.submit(self._run_process, job["job_id"], script_ids, question_ids)
         return job
 
@@ -127,14 +125,18 @@ class JobRunner:
                 else "No processed scripts to grade yet. Upload and process scripts first."
             )
 
-        job = self.jobs.create(exam_id, "grade", total=len(plan))
+        job = self.jobs.create(exam_id, "grade", total=len(plan))  # may raise JobConflict
         if regrade:
             # A re-grade replaces the earlier AI marks: clear them now, so the results grid and
             # review queue never mix old and new grades while the job runs. Teacher-approved
             # marks are not in the plan and the delete refuses them as well.
             self.evaluations.delete_ai_grades([(sid, spec.question_id) for sid, spec in plan])
         self._executor.submit(
-            self._run_grade, job["job_id"], plan, exam["review_confidence_threshold"]
+            self._run_grade,
+            job["job_id"],
+            plan,
+            exam["review_confidence_threshold"],
+            float(exam["mark_step"]),
         )
         return job
 
@@ -186,9 +188,9 @@ class JobRunner:
         job_id: str,
         plan: list[tuple[str, QuestionSpec]],
         exam_threshold: float,
+        mark_step: float,
     ) -> None:
         self.jobs.update(job_id, status="running")
-        touched: list[str] = []
         answers_cache: dict[str, dict[str, str]] = {}
         pages_cache: dict[str, dict[str, int]] = {}
         labels: dict[str, str] = {}
@@ -205,15 +207,19 @@ class JobRunner:
                         self.extractions.answers_for_script(script_id)
                     )
                     labels[script_id] = self.scripts.label(script_id)
-                if script_id not in touched:
-                    touched.append(script_id)
 
                 self.jobs.update(job_id, message=f"{labels[script_id]} · {spec.question_id}")
                 answer = lookup_answer(answers_cache[script_id], spec.question_id)
                 page_number = pages_cache[script_id].get(spec.question_id)
                 try:
                     self.grader.grade_and_store(
-                        script_id, spec, answer, exam_threshold, page_number
+                        script_id,
+                        spec,
+                        answer,
+                        exam_threshold,
+                        page_number,
+                        mark_step=mark_step,
+                        job_id=job_id,
                     )
                 except ModelUnavailable as exc:
                     final = {
@@ -239,6 +245,4 @@ class JobRunner:
             log.exception("Grade job %s crashed", job_id)
             final = {"status": "failed", "message": "", "error": str(exc)}
         finally:
-            for script_id in touched:
-                self.exams.refresh_script_status(script_id)
             self.jobs.update(job_id, **final)

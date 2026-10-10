@@ -41,7 +41,10 @@ def list_exam_evaluator_configs(c: ContainerDep) -> dict[str, object]:
 
 @router.post("/evaluator-configs")
 def create_exam_evaluator_config(body: EvaluatorConfigCreate, c: ContainerDep) -> dict[str, object]:
-    return c.evaluator_configs.create(body.model_dump())
+    try:
+        return c.evaluator_configs.create(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{exam_id}")
@@ -75,12 +78,16 @@ def update_exam_detail(exam_id: str, body: ExamUpdate, c: ContainerDep) -> dict[
             item = q.model_dump()
             item["question_id"] = item["question_id"].strip()
             questions.append(item)
-    exam = c.exams.update(
-        exam_id,
-        name=body.name,
-        questions=questions,
-        review_confidence_threshold=body.review_confidence_threshold,
-    )
+    try:
+        exam = c.exams.update(
+            exam_id,
+            name=body.name,
+            questions=questions,
+            review_confidence_threshold=body.review_confidence_threshold,
+            mark_step=body.mark_step,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
     return exam

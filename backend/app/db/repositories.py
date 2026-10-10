@@ -1,52 +1,118 @@
-"""Repository classes: all SQL for students, scripts, extractions, evaluations and rubric
-templates. Each takes a ``Database``; every method accepts an optional open connection so
-several calls can share one transaction."""
+"""Repository classes: all SQL for students, scripts, extractions and evaluations.
+
+Each takes a ``Database``; every method accepts an optional open connection so several calls
+can share one transaction. Rows come back as plain dicts whose ids are strings and whose
+numeric columns are floats (see Database).
+
+Two ideas to keep in mind when reading the evaluation queries:
+
+* ``ai_marks`` is what the model awarded and is never changed after grading. ``final_marks`` is
+  what counts: it equals ``ai_marks`` until a teacher overrides it. The API still calls it
+  ``awarded_marks``.
+* "Needs review" is never stored. The ``evaluation_state`` view derives it from the confidence,
+  the threshold currently configured for the question/exam, and any rule-based flags, so
+  changing a threshold never needs a re-grade.
+"""
 
 from __future__ import annotations
 
-import json
+from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID
 
+import psycopg
 from backend.app.db.database import Connection, Database
 from backend.app.models.domain import GradeResult, QuestionSpec, ReviewPolicy
+from psycopg.types.json import Jsonb
 
 
-def _rows(cursor: Any) -> list[dict[str, Any]]:
-    return [dict(r) for r in cursor.fetchall()]
+class ScriptConflict(ValueError):
+    """The exam already has a script for this student, or this exact file."""
+
+
+def as_uuid(value: Any) -> UUID | None:
+    """Parse an id coming from a URL or request body; None when it isn't a UUID, so callers can
+    answer "not found" instead of crashing the query."""
+    try:
+        return UUID(str(value))
+    except ValueError:
+        return None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def returned(row: dict[str, Any] | None) -> dict[str, Any]:
+    """The row an ``INSERT ... RETURNING`` or an aggregate ``SELECT`` always yields."""
+    if row is None:
+        raise RuntimeError("The database returned no row")
+    return row
 
 
 class StudentRepository:
+    """Students are addressed by their external id (roll number, dataset id) everywhere in the
+    API; the UUID primary key stays internal."""
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
     def upsert(self, student_id: str, name: str = "", conn: Connection | None = None) -> None:
         with self.db.use(conn) as c:
             c.execute(
-                "INSERT OR IGNORE INTO students(student_id, name) VALUES (?, ?)",
+                "insert into students (external_id, name) values (%s, %s) "
+                "on conflict (external_id) do nothing",
                 (student_id, name),
             )
 
     def list_all(self) -> list[dict[str, Any]]:
         with self.db.use() as c:
-            return _rows(
+            return list(
                 c.execute(
-                    "SELECT s.student_id, s.name, s.created_at, "
-                    "COUNT(sc.script_id) AS script_count "
-                    "FROM students s LEFT JOIN scripts sc ON s.student_id=sc.student_id "
-                    "GROUP BY s.student_id ORDER BY s.created_at DESC"
-                )
+                    "select st.external_id as student_id, st.name, st.created_at, "
+                    "count(sc.id)::int as script_count "
+                    "from students st left join scripts sc on sc.student_id = st.id "
+                    "group by st.id order by st.created_at desc"
+                ).fetchall()
             )
 
     def get(self, student_id: str, conn: Connection | None = None) -> dict[str, Any] | None:
         with self.db.use(conn) as c:
-            row = c.execute("SELECT * FROM students WHERE student_id=?", (student_id,)).fetchone()
-            return dict(row) if row else None
+            return c.execute(
+                "select external_id as student_id, name, created_at "
+                "from students where external_id = %s",
+                (student_id,),
+            ).fetchone()
+
+
+_SCRIPT_SELECT = """
+    select sc.id as script_id, st.external_id as student_id, st.name as student_name,
+           sc.exam_id, e.name as exam_name, sc.filename, sc.storage_key,
+           sc.status::text as status, sc.page_count, sc.error, sc.created_at
+    from scripts sc
+    join students st on st.id = sc.student_id
+    join exams e on e.id = sc.exam_id
+"""
 
 
 class ScriptRepository:
-    def __init__(self, db: Database) -> None:
+    """Uploaded scripts. The row stores an object key; the local processing copy lives at
+    ``upload_dir/<script_id><suffix>``, which is what ``file_path`` points at."""
+
+    def __init__(self, db: Database, upload_dir: Path) -> None:
         self.db = db
+        self.upload_dir = upload_dir
+
+    def _script(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        suffix = Path(row["storage_key"]).suffix
+        row["file_path"] = str(self.upload_dir / f"{row['script_id']}{suffix}")
+        return row
+
+    @staticmethod
+    def object_key(script_id: str, file_path: str) -> str:
+        return f"uploads/{script_id}/original{Path(file_path).suffix.lower()}"
 
     def insert(
         self,
@@ -54,40 +120,67 @@ class ScriptRepository:
         student_id: str,
         filename: str,
         file_path: str,
-        exam_id: str | None = None,
+        exam_id: str,
+        file_sha256: str | None = None,
+        student_name: str | None = None,
     ) -> None:
-        with self.db.use() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO scripts "
-                "(script_id, student_id, filename, file_path, exam_id) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (script_id, student_id, filename, file_path, exam_id),
-            )
+        """Add a script to an exam. Raises ScriptConflict for a second script by the same
+        student or a byte-identical file, and LookupError for an unknown exam or student.
+
+        Pass ``student_name`` to create the student in the same transaction, so a rejected
+        upload leaves no student behind."""
+        exam_uuid, script_uuid = as_uuid(exam_id), as_uuid(script_id)
+        if exam_uuid is None:
+            raise LookupError("Exam not found")
+        if script_uuid is None:
+            raise ValueError("script_id must be a UUID")
+        try:
+            with self.db.use() as c:
+                if student_name is not None:
+                    StudentRepository(self.db).upsert(student_id, student_name, c)
+                cursor = c.execute(
+                    "insert into scripts (id, exam_id, student_id, filename, storage_key, "
+                    "file_sha256) "
+                    "select %s, %s, st.id, %s, %s, %s from students st where st.external_id = %s",
+                    (
+                        script_uuid,
+                        exam_uuid,
+                        filename,
+                        self.object_key(str(script_uuid), file_path),
+                        file_sha256,
+                        student_id,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    raise LookupError("Student not found")
+        except psycopg.errors.ForeignKeyViolation as exc:
+            raise LookupError("Exam not found") from exc
+        except psycopg.errors.UniqueViolation as exc:
+            if exc.diag.constraint_name == "scripts_exam_sha_uniq":
+                raise ScriptConflict("This exact file is already uploaded to this exam.") from exc
+            raise ScriptConflict("This student already has a script in this exam.") from exc
 
     def get(self, script_id: str, conn: Connection | None = None) -> dict[str, Any] | None:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return None
         with self.db.use(conn) as c:
-            row = c.execute("SELECT * FROM scripts WHERE script_id=?", (script_id,)).fetchone()
-            return dict(row) if row else None
+            return self._script(
+                c.execute(_SCRIPT_SELECT + " where sc.id = %s", (script_uuid,)).fetchone()
+            )
 
     def list_for_student(self, student_id: str) -> list[dict[str, Any]]:
         with self.db.use() as c:
-            return _rows(
-                c.execute(
-                    "SELECT * FROM scripts WHERE student_id=? ORDER BY created_at DESC",
-                    (student_id,),
-                )
-            )
+            rows = c.execute(
+                _SCRIPT_SELECT + " where st.external_id = %s order by sc.created_at desc",
+                (student_id,),
+            ).fetchall()
+        return [s for s in (self._script(r) for r in rows) if s]
 
     def list_all(self) -> list[dict[str, Any]]:
         with self.db.use() as c:
-            return _rows(
-                c.execute(
-                    "SELECT sc.*, st.name AS student_name, e.name AS exam_name FROM scripts sc "
-                    "LEFT JOIN students st ON sc.student_id=st.student_id "
-                    "LEFT JOIN exams e ON sc.exam_id=e.exam_id "
-                    "ORDER BY sc.created_at DESC"
-                )
-            )
+            rows = c.execute(_SCRIPT_SELECT + " order by sc.created_at desc").fetchall()
+        return [s for s in (self._script(r) for r in rows) if s]
 
     def set_status(
         self,
@@ -96,37 +189,61 @@ class ScriptRepository:
         page_count: int | None = None,
         error: str | None = None,
     ) -> None:
-        """Set the status and clear/set the error. page_count is only changed when given."""
+        """Set the pipeline status (uploaded / processing / processed / error) and set or
+        clear the error. page_count is only changed when given. Whether a script is graded or
+        needs review is derived from its evaluations, never stored here."""
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return
         with self.db.use() as c:
             c.execute(
-                "UPDATE scripts SET status=?, page_count=COALESCE(?, page_count), error=? "
-                "WHERE script_id=?",
-                (status, page_count, error, script_id),
+                "update scripts set status = %s::script_status, "
+                "page_count = coalesce(%s, page_count), error = %s where id = %s",
+                (status, page_count, error, script_uuid),
             )
+
+    def set_page_count(self, script_id: str, page_count: int) -> None:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return
+        with self.db.use() as c:
+            c.execute("update scripts set page_count = %s where id = %s", (page_count, script_uuid))
 
     def reset_stuck(self, script_ids: list[str]) -> None:
         """Put scripts a cancelled/failed job left 'processing' back to 'uploaded'."""
+        ids = [u for u in (as_uuid(s) for s in script_ids) if u is not None]
+        if not ids:
+            return
         with self.db.use() as c:
-            c.executemany(
-                "UPDATE scripts SET status='uploaded' WHERE script_id=? AND status='processing'",
-                [(sid,) for sid in script_ids],
+            c.execute(
+                "update scripts set status = 'uploaded' "
+                "where id = any(%s::uuid[]) and status = 'processing'",
+                (ids,),
             )
 
     def label(self, script_id: str) -> str:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return script_id
         with self.db.use() as c:
             row = c.execute(
-                "SELECT sc.filename, st.name FROM scripts sc "
-                "LEFT JOIN students st ON st.student_id = sc.student_id WHERE sc.script_id=?",
-                (script_id,),
+                "select coalesce(nullif(st.name, ''), sc.filename) as label "
+                "from scripts sc join students st on st.id = sc.student_id where sc.id = %s",
+                (script_uuid,),
             ).fetchone()
-        return (row["name"] or row["filename"]) if row else script_id
+        return str(row["label"]) if row else script_id
 
     def delete(self, script_id: str) -> None:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return
         with self.db.use() as c:
-            c.execute("DELETE FROM scripts WHERE script_id=?", (script_id,))
+            c.execute("delete from scripts where id = %s", (script_uuid,))
 
 
 class ExtractionRepository:
+    """What the vision model read from each script, one row per (script, question label)."""
+
     def __init__(self, db: Database) -> None:
         self.db = db
 
@@ -135,68 +252,127 @@ class ExtractionRepository:
         script_id: str,
         question_id: str,
         extracted_text: str,
-        extraction_method: str,
         *,
-        page_number: int | None = None,
+        page_numbers: list[int] | None = None,
         question_number: int | None = None,
-        question_type: str = "unknown",
-        extraction_confidence: float | None = None,
-        needs_review: bool = False,
-        review_reason: str = "",
+        confidence: float | None = None,
+        model: str | None = None,
+        prompt_version: str | None = None,
+        flags: list[str] | None = None,
+        answer_state: str | None = None,
     ) -> None:
+        """Store one answer. ``answer_state`` is derived from the text unless given
+        ('not_found' marks an exam question the model never found on any page)."""
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            raise LookupError("Script not found")
+        state = answer_state or ("answered" if extracted_text.strip() else "blank")
         with self.db.use() as c:
             c.execute(
                 """
-                INSERT INTO question_extractions
-                    (extraction_id, script_id, question_id, question_number, question_type,
-                     page_number, extracted_text, extraction_method, extraction_confidence,
-                     needs_review, review_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(script_id, question_id) DO UPDATE SET
-                    question_number=excluded.question_number,
-                    question_type=excluded.question_type,
-                    page_number=excluded.page_number,
-                    extracted_text=excluded.extracted_text,
-                    extraction_method=excluded.extraction_method,
-                    extraction_confidence=excluded.extraction_confidence,
-                    needs_review=excluded.needs_review,
-                    review_reason=excluded.review_reason
+                insert into extractions
+                    (script_id, question_id, question_number, page_numbers, extracted_text,
+                     answer_state, confidence, model, prompt_version, flags)
+                values (%s, %s, %s, %s::integer[], %s, %s::answer_state, %s, %s, %s, %s::text[])
+                on conflict (script_id, question_id) do update set
+                    question_number = excluded.question_number,
+                    page_numbers    = excluded.page_numbers,
+                    extracted_text  = excluded.extracted_text,
+                    answer_state    = excluded.answer_state,
+                    confidence      = excluded.confidence,
+                    model           = excluded.model,
+                    prompt_version  = excluded.prompt_version,
+                    flags           = excluded.flags
                 """,
                 (
-                    uuid4().hex,
-                    script_id,
+                    script_uuid,
                     question_id,
                     question_number,
-                    question_type,
-                    page_number,
+                    page_numbers or [],
                     extracted_text,
-                    extraction_method,
-                    extraction_confidence,
-                    int(needs_review),
-                    review_reason,
+                    state,
+                    None if confidence is None else _clamp(confidence, 0.0, 1.0),
+                    model,
+                    prompt_version,
+                    flags or [],
                 ),
             )
 
     def for_script(self, script_id: str, conn: Connection | None = None) -> list[dict[str, Any]]:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return []
         with self.db.use(conn) as c:
-            return _rows(
+            return list(
                 c.execute(
-                    "SELECT * FROM question_extractions WHERE script_id=? ORDER BY question_id",
-                    (script_id,),
-                )
+                    """
+                    select x.id as extraction_id, x.script_id, x.question_id, x.question_number,
+                           coalesce(q.question_type::text, 'unknown') as question_type,
+                           x.page_numbers, x.page_numbers[1] as page_number,
+                           x.extracted_text, x.answer_state::text as answer_state,
+                           coalesce(x.model, 'unknown') as extraction_method, x.model,
+                           x.prompt_version, x.confidence as extraction_confidence,
+                           cardinality(x.flags) > 0 as needs_review,
+                           array_to_string(x.flags, ' ') as review_reason, x.flags, x.created_at
+                    from extractions x
+                    join scripts s on s.id = x.script_id
+                    left join exam_questions q
+                           on q.exam_id = s.exam_id and q.question_id = x.question_id
+                    where x.script_id = %s
+                    order by coalesce(x.question_number, 2147483647), x.question_id
+                    """,
+                    (script_uuid,),
+                ).fetchall()
             )
 
     def answers_for_script(self, script_id: str) -> tuple[dict[str, str], dict[str, int]]:
-        """(question_id -> extracted text, question_id -> page number)."""
+        """(question_id -> extracted text, question_id -> first page of the answer)."""
         rows = self.for_script(script_id)
         answers = {r["question_id"]: r["extracted_text"] for r in rows}
-        pages = {r["question_id"]: r["page_number"] for r in rows if r["page_number"] is not None}
+        pages = {r["question_id"]: r["page_numbers"][0] for r in rows if r["page_numbers"]}
         return answers, pages
 
 
+def _grader_kind(result: GradeResult) -> str:
+    evaluator = (result.evaluator_snapshot or {}).get("evaluator")
+    return {"rule": "rule_blank", "deterministic": "deterministic", "slm": "slm"}.get(
+        str(evaluator), "llm"
+    )
+
+
+# Reads a grade together with everything the review screens show about it. The snapshot taken
+# at grading time wins over the live question/extraction, so what the teacher sees is what the
+# model was actually given.
+_EVALUATION_SELECT = """
+    select es.id as eval_id, es.script_id, q.question_id,
+           coalesce(es.grading_snapshot->>'question_text', q.question_text) as question_text,
+           coalesce(es.grading_snapshot->>'question_type', q.question_type::text) as question_type,
+           coalesce(es.grading_snapshot->>'answer_text', x.extracted_text, '') as answer_text,
+           coalesce(nullif(es.grading_snapshot->>'page_number', '')::integer,
+                    x.page_numbers[1]) as page_number,
+           coalesce(es.grading_snapshot->>'golden_answer', q.golden_answer) as golden_answer,
+           coalesce(es.grading_snapshot->'rubric', '[]'::jsonb) as rubric,
+           es.max_marks, es.final_marks as awarded_marks, es.ai_marks, es.confidence,
+           es.effective_threshold as review_threshold, es.criteria_scores, es.needs_review,
+           case when es.review_status = 'teacher_approved' then 'teacher_approved'
+                when es.needs_review then 'needs_review'
+                else 'scored' end as status,
+           es.evidence, es.reasoning, es.llm_output as llm_reasoning, es.model as llm_model,
+           es.grading_snapshot->'evaluator' as evaluator_snapshot,
+           case when es.review_status = 'teacher_approved' and es.final_marks <> es.ai_marks
+                then es.final_marks end as teacher_override,
+           es.teacher_reason as teacher_override_reason,
+           es.flag_reasons as rule_flags, es.grader_kind::text as grader_kind,
+           es.created_at, es.updated_at
+    from evaluation_state es
+    join scripts s on s.id = es.script_id
+    join exam_questions q on q.id = es.exam_question_id
+    left join extractions x on x.id = es.extraction_id
+"""
+
+
 class EvaluationRepository:
-    """Per-question grades. Whether a grade "needs review" is derived at read time from its
-    stored confidence and threshold (see ReviewPolicy)."""
+    """Per-question grades."""
 
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -206,249 +382,252 @@ class EvaluationRepository:
         script_id: str,
         spec: QuestionSpec,
         result: GradeResult,
-        threshold: float,
+        *,
+        rule_flags: list[str] | None = None,
+        job_id: str | None = None,
         conn: Connection | None = None,
     ) -> None:
-        # A teacher's decision is final: the WHERE clause below makes a re-grade (from any path:
-        # jobs, the per-script endpoint, a batch run) leave an approved answer untouched. The
-        # columns written at grade time that depend on the threshold are ignored when reading;
-        # `status` only matters here for 'teacher_approved'.
-        llm_reasoning = dict(result.llm_reasoning or {})
-        llm_reasoning["flag_reasons"] = result.flag_reasons
+        """Store a grade, replacing an earlier AI grade for the same answer. A teacher's
+        decision is final: the WHERE clause makes a re-grade (from any path: jobs, the
+        per-script endpoint) leave a teacher-approved answer untouched.
+
+        ``rule_flags`` are the reasons that do not depend on confidence; the confidence flag
+        is derived when the grade is read, so it is not stored."""
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            raise LookupError("Script not found")
+        marks = round(_clamp(result.awarded_marks, 0.0, spec.max_marks), 2)
+        snapshot = {
+            "question_text": spec.question_text,
+            "question_type": spec.question_type,
+            "golden_answer": spec.golden_answer,
+            "rubric": spec.criteria,
+            "options": spec.options,
+            "guidance": spec.guidance,
+            "max_marks": spec.max_marks,
+            "answer_text": result.answer_text,
+            "page_number": result.page_number,
+            "evaluator": result.evaluator_snapshot,
+        }
         with self.db.use(conn) as c:
+            target = c.execute(
+                """
+                select q.id as exam_question_id,
+                       (select x.id from extractions x
+                         where x.script_id = s.id and x.question_id = q.question_id)
+                         as extraction_id
+                from scripts s
+                join exam_questions q on q.exam_id = s.exam_id and q.question_id = %s
+                where s.id = %s
+                """,
+                (spec.question_id, script_uuid),
+            ).fetchone()
+            if target is None:
+                raise LookupError(f"Question {spec.question_id} is not part of this script's exam")
             c.execute(
                 """
-                INSERT INTO question_evaluations
-                    (eval_id, script_id, question_id, question_text, question_type, answer_text,
-                     page_number, golden_answer, rubric_json, max_marks, awarded_marks, confidence,
-                     threshold_used, criteria_scores_json, status, evidence_json, reasoning,
-                     llm_reasoning_json, llm_model, evaluator_snapshot_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(script_id, question_id) DO UPDATE SET
-                    question_text=excluded.question_text,
-                    question_type=excluded.question_type,
-                    answer_text=excluded.answer_text,
-                    page_number=excluded.page_number,
-                    golden_answer=excluded.golden_answer,
-                    rubric_json=excluded.rubric_json,
-                    max_marks=excluded.max_marks,
-                    awarded_marks=excluded.awarded_marks,
-                    confidence=excluded.confidence,
-                    threshold_used=excluded.threshold_used,
-                    criteria_scores_json=excluded.criteria_scores_json,
-                    status=excluded.status,
-                    evidence_json=excluded.evidence_json,
-                    reasoning=excluded.reasoning,
-                    llm_reasoning_json=excluded.llm_reasoning_json,
-                    llm_model=excluded.llm_model,
-                    evaluator_snapshot_json=excluded.evaluator_snapshot_json,
-                    teacher_override=NULL,
-                    teacher_override_reason=NULL,
-                    updated_at=datetime('now')
-                WHERE question_evaluations.status != 'teacher_approved'
+                insert into evaluations
+                    (script_id, exam_question_id, extraction_id, job_id, grader_kind, max_marks,
+                     ai_marks, final_marks, confidence, flag_reasons, reasoning, evidence,
+                     criteria_scores, llm_output, grading_snapshot, model)
+                values (%(script)s, %(question)s, %(extraction)s, %(job)s,
+                        %(kind)s::grader_kind, %(max)s, %(marks)s, %(marks)s, %(confidence)s,
+                        %(flags)s::text[], %(reasoning)s, %(evidence)s, %(criteria)s,
+                        %(llm)s, %(snapshot)s, %(model)s)
+                on conflict (script_id, exam_question_id) do update set
+                    extraction_id    = excluded.extraction_id,
+                    job_id           = excluded.job_id,
+                    grader_kind      = excluded.grader_kind,
+                    max_marks        = excluded.max_marks,
+                    ai_marks         = excluded.ai_marks,
+                    final_marks      = excluded.final_marks,
+                    confidence       = excluded.confidence,
+                    flag_reasons     = excluded.flag_reasons,
+                    reasoning        = excluded.reasoning,
+                    evidence         = excluded.evidence,
+                    criteria_scores  = excluded.criteria_scores,
+                    llm_output       = excluded.llm_output,
+                    grading_snapshot = excluded.grading_snapshot,
+                    model            = excluded.model,
+                    review_status    = 'unreviewed',
+                    reviewed_at      = null,
+                    teacher_reason   = null
+                where evaluations.review_status <> 'teacher_approved'
                 """,
-                (
-                    uuid4().hex,
-                    script_id,
-                    spec.question_id,
-                    spec.question_text,
-                    result.question_type or spec.question_type or "unknown",
-                    result.answer_text,
-                    result.page_number,
-                    spec.golden_answer,
-                    json.dumps(spec.criteria),
-                    spec.max_marks,
-                    result.awarded_marks,
-                    result.confidence,
-                    threshold,
-                    json.dumps(result.criteria_scores),
-                    result.status,
-                    json.dumps(result.evidence),
-                    result.reasoning,
-                    json.dumps(llm_reasoning),
-                    result.llm_model,
-                    json.dumps(result.evaluator_snapshot) if result.evaluator_snapshot else None,
-                ),
+                {
+                    "script": script_uuid,
+                    "question": target["exam_question_id"],
+                    "extraction": target["extraction_id"],
+                    "job": as_uuid(job_id) if job_id else None,
+                    "kind": _grader_kind(result),
+                    "max": spec.max_marks,
+                    "marks": marks,
+                    "confidence": _clamp(result.confidence, 0.0, 1.0),
+                    "flags": rule_flags or [],
+                    "reasoning": result.reasoning,
+                    "evidence": Jsonb(result.evidence),
+                    "criteria": Jsonb(result.criteria_scores),
+                    "llm": (
+                        Jsonb(result.llm_reasoning) if result.llm_reasoning is not None else None
+                    ),
+                    "snapshot": Jsonb(snapshot),
+                    "model": result.llm_model,
+                },
             )
 
     def delete_ai_grades(self, keys: list[tuple[str, str]]) -> None:
         """Delete the stored grades for (script_id, question_id) pairs ahead of a re-grade.
         A teacher-approved grade is never deleted."""
-        if not keys:
+        rows = [(u, qid) for sid, qid in keys if (u := as_uuid(sid)) is not None]
+        if not rows:
             return
-        with self.db.use() as c:
-            c.executemany(
-                "DELETE FROM question_evaluations "
-                "WHERE script_id=? AND question_id=? AND status != 'teacher_approved'",
-                keys,
+        with self.db.use() as c, c.cursor() as cur:
+            cur.executemany(
+                """
+                delete from evaluations ev
+                using exam_questions q, scripts s
+                where ev.script_id = %s and s.id = ev.script_id and q.id = ev.exam_question_id
+                  and q.exam_id = s.exam_id and q.question_id = %s
+                  and ev.review_status <> 'teacher_approved'
+                """,
+                rows,
             )
 
     def apply_override(
         self, script_id: str, question_id: str, awarded_marks: float, reason: str
     ) -> bool:
+        """Record a teacher's decision. The AI's mark (ai_marks) is kept; final_marks becomes the
+        teacher's. Approving the AI's mark as-is is an override with the same value."""
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return False
         with self.db.use() as c:
             cursor = c.execute(
                 """
-                UPDATE question_evaluations
-                SET awarded_marks=?, teacher_override=?, teacher_override_reason=?,
-                    status='teacher_approved', updated_at=datetime('now')
-                WHERE script_id=? AND question_id=?
+                update evaluations ev
+                set final_marks = %s, review_status = 'teacher_approved', reviewed_at = now(),
+                    teacher_reason = %s
+                from exam_questions q
+                where ev.script_id = %s and q.id = ev.exam_question_id and q.question_id = %s
                 """,
-                (awarded_marks, awarded_marks, reason, script_id, question_id),
+                (awarded_marks, reason, script_uuid, question_id),
             )
             return bool(cursor.rowcount > 0)
 
     def statuses_for_exam(self, exam_id: str) -> dict[tuple[str, str], str]:
+        exam_uuid = as_uuid(exam_id)
+        if exam_uuid is None:
+            return {}
         with self.db.use() as c:
-            return {
-                (r["script_id"], r["question_id"]): r["status"]
-                for r in c.execute(
-                    "SELECT qe.script_id, qe.question_id, qe.status FROM question_evaluations qe "
-                    "JOIN scripts s ON s.script_id = qe.script_id WHERE s.exam_id=?",
-                    (exam_id,),
-                )
-            }
+            rows = c.execute(
+                """
+                select ev.script_id, q.question_id, ev.review_status::text as status
+                from evaluations ev
+                join scripts s on s.id = ev.script_id
+                join exam_questions q on q.id = ev.exam_question_id
+                where s.exam_id = %s
+                """,
+                (exam_uuid,),
+            ).fetchall()
+        return {(r["script_id"], r["question_id"]): r["status"] for r in rows}
+
+    @staticmethod
+    def _present(row: dict[str, Any]) -> dict[str, Any]:
+        """Add the derived fields the API exposes: the full list of flag reasons (rule-based
+        ones plus the live confidence one) mirrored into llm_reasoning for older clients."""
+        policy = ReviewPolicy(row["review_threshold"])
+        reasons = policy.flag_reasons(row.pop("rule_flags"), row["confidence"], row["status"])
+        row["flag_reasons"] = reasons
+        if isinstance(row["llm_reasoning"], dict):
+            row["llm_reasoning"]["flag_reasons"] = reasons
+        return row
 
     def for_script(self, script_id: str, conn: Connection | None = None) -> list[dict[str, Any]]:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return []
         with self.db.use(conn) as c:
             rows = c.execute(
-                "SELECT * FROM question_evaluations WHERE script_id=? ORDER BY question_id",
-                (script_id,),
+                _EVALUATION_SELECT + " where es.script_id = %s order by q.question_number",
+                (script_uuid,),
             ).fetchall()
-        results = []
-        for row in rows:
-            d = dict(row)
-            d["rubric"] = json.loads(d.pop("rubric_json", "[]"))
-            d["evidence"] = json.loads(d.pop("evidence_json", "[]"))
-            d["criteria_scores"] = json.loads(d.pop("criteria_scores_json", "[]"))
-            snapshot_raw = d.pop("evaluator_snapshot_json", None)
-            d["evaluator_snapshot"] = json.loads(snapshot_raw) if snapshot_raw else None
-            llm_raw = d.pop("llm_reasoning_json", None)
-            d["llm_reasoning"] = json.loads(llm_raw) if llm_raw else None
-
-            policy = ReviewPolicy(d.get("threshold_used"))
-            d["status"] = policy.effective_status(d["status"], d["confidence"])
-            d["needs_review"] = d["status"] == "needs_review"
-            d["review_threshold"] = policy.threshold
-            stored = (d["llm_reasoning"] or {}).get("flag_reasons")
-            reasons = policy.flag_reasons(stored, d["confidence"], d["status"])
-            if isinstance(d["llm_reasoning"], dict):
-                d["llm_reasoning"]["flag_reasons"] = reasons
-            d["flag_reasons"] = reasons
-            results.append(d)
-        return results
+        return [self._present(r) for r in rows]
 
     def totals_for_script(self, script_id: str) -> dict[str, Any]:
+        script_uuid = as_uuid(script_id)
+        if script_uuid is None:
+            return {}
         with self.db.use() as c:
             row = c.execute(
                 """
-                SELECT
-                    COUNT(*) as total_questions,
-                    COALESCE(SUM(awarded_marks), 0) as total_awarded,
-                    COALESCE(SUM(max_marks), 0) as total_max,
-                    COALESCE(SUM(CASE WHEN status != 'teacher_approved'
-                                       AND confidence < threshold_used
-                                      THEN 1 ELSE 0 END), 0) as needs_review_count,
-                    COALESCE(SUM(CASE WHEN status='teacher_approved' THEN 1 ELSE 0 END), 0)
-                        as approved_count
-                FROM question_evaluations WHERE script_id=?
+                select count(*)::int as total_questions,
+                       coalesce(sum(final_marks), 0) as total_awarded,
+                       coalesce(sum(max_marks), 0) as total_max,
+                       (count(*) filter (where needs_review))::int as needs_review_count,
+                       (count(*) filter (where review_status = 'teacher_approved'))::int
+                           as approved_count
+                from evaluation_state where script_id = %s
                 """,
-                (script_id,),
+                (script_uuid,),
             ).fetchone()
-            return dict(row) if row else {}
+        return row or {}
 
     def review_queue(self, exam_id: str | None = None) -> list[dict[str, Any]]:
+        exam_uuid = as_uuid(exam_id) if exam_id else None
+        if exam_id and exam_uuid is None:
+            return []
         with self.db.use() as c:
             rows = c.execute(
                 """
-                SELECT qe.eval_id, qe.script_id, qe.question_id, qe.question_text,
-                    qe.page_number, qe.golden_answer, qe.max_marks, qe.awarded_marks,
-                    qe.confidence, qe.status, qe.reasoning, qe.llm_model,
-                    qe.evidence_json, qe.llm_reasoning_json, qe.created_at,
-                    s.filename, s.student_id, s.page_count, st.name AS student_name,
-                    qe_source.source_path, qe_source.extracted_text AS answer_text,
-                    qe.threshold_used AS review_threshold
-                FROM question_evaluations qe
-                JOIN scripts s ON qe.script_id = s.script_id
-                LEFT JOIN students st ON s.student_id = st.student_id
-                LEFT JOIN question_extractions qe_source
-                    ON qe.script_id = qe_source.script_id AND qe.question_id = qe_source.question_id
-                WHERE qe.status != 'teacher_approved'
-                  AND qe.confidence < qe.threshold_used
-                  AND (CAST(? AS TEXT) IS NULL OR s.exam_id = ?)
-                ORDER BY s.filename, qe.question_id
+                select es.id as eval_id, es.script_id, q.question_id,
+                       coalesce(es.grading_snapshot->>'question_text', q.question_text)
+                           as question_text,
+                       coalesce(nullif(es.grading_snapshot->>'page_number', '')::integer,
+                                x.page_numbers[1]) as page_number,
+                       coalesce(es.grading_snapshot->>'golden_answer', q.golden_answer)
+                           as golden_answer,
+                       es.max_marks, es.final_marks as awarded_marks, es.confidence,
+                       es.reasoning, es.model as llm_model, es.evidence,
+                       es.effective_threshold as review_threshold,
+                       es.flag_reasons as rule_flags, es.created_at,
+                       s.filename, st.external_id as student_id, s.page_count,
+                       st.name as student_name,
+                       coalesce(es.grading_snapshot->>'answer_text', x.extracted_text, '')
+                           as answer_text,
+                       'needs_review' as status
+                from evaluation_state es
+                join scripts s on s.id = es.script_id
+                join students st on st.id = s.student_id
+                join exam_questions q on q.id = es.exam_question_id
+                left join extractions x on x.id = es.extraction_id
+                where es.needs_review and (%(exam)s::uuid is null or s.exam_id = %(exam)s::uuid)
+                order by s.filename, q.question_number
                 """,
-                (exam_id, exam_id),
+                {"exam": exam_uuid},
             ).fetchall()
-
         items = []
         for row in rows:
-            item = dict(row)
-            try:
-                item["evidence"] = json.loads(item.pop("evidence_json", "[]"))
-            except (json.JSONDecodeError, TypeError):
-                item["evidence"] = []
-            try:
-                llm = json.loads(item.pop("llm_reasoning_json", None) or "{}")
-                stored = llm.get("flag_reasons", []) if isinstance(llm, dict) else []
-            except (json.JSONDecodeError, TypeError):
-                stored = []
-            policy = ReviewPolicy(item["review_threshold"])
-            item["review_threshold"] = policy.threshold
-            item["status"] = "needs_review"
-            item["flag_reasons"] = policy.flag_reasons(stored, item["confidence"], item["status"])
-            items.append(item)
+            policy = ReviewPolicy(row["review_threshold"])
+            row["flag_reasons"] = policy.flag_reasons(
+                row.pop("rule_flags"), row["confidence"], row["status"]
+            )
+            items.append(row)
         return items
 
     def stats(self) -> dict[str, int]:
-        def count(conn: Connection, where: str = "", table: str = "question_evaluations") -> int:
-            query = f"SELECT COUNT(*) AS n FROM {table}{where}"  # noqa: S608 - fixed fragments
-            return int(conn.execute(query).fetchone()["n"])
-
         with self.db.use() as c:
-            total_students = count(c, table="students")
-            total_scripts = count(c, table="scripts")
-            graded = count(c)
-            needs_review = count(
-                c, " WHERE status != 'teacher_approved' AND confidence < threshold_used"
+            row = returned(
+                c.execute(
+                    """
+                select (select count(*) from students)::int as total_students,
+                       (select count(*) from scripts)::int as total_scripts,
+                       (select count(*) from evaluations)::int as total_questions_graded,
+                       (select count(*) from evaluation_state where needs_review)::int
+                           as needs_review,
+                       (select count(*) from evaluations
+                         where review_status = 'teacher_approved')::int as approved
+                """
+                ).fetchone()
             )
-            approved = count(c, " WHERE status='teacher_approved'")
-        return {
-            "total_students": total_students,
-            "total_scripts": total_scripts,
-            "total_questions_graded": graded,
-            "needs_review": needs_review,
-            "approved": approved,
-            "scored": graded - approved - needs_review,
-        }
-
-
-class RubricConfigRepository:
-    """Reusable rubric templates."""
-
-    def __init__(self, db: Database) -> None:
-        self.db = db
-
-    def list_all(self) -> list[dict[str, Any]]:
-        with self.db.use() as c:
-            return _rows(c.execute("SELECT * FROM rubric_configs ORDER BY created_at DESC"))
-
-    def save(self, name: str, config: Any) -> str:
-        config_id = uuid4().hex
-        with self.db.use() as c:
-            c.execute(
-                "INSERT INTO rubric_configs(config_id, name, config_json) VALUES (?, ?, ?)",
-                (config_id, name, json.dumps(config)),
-            )
-        return config_id
-
-    def get(self, config_id: str) -> dict[str, Any] | None:
-        with self.db.use() as c:
-            row = c.execute(
-                "SELECT * FROM rubric_configs WHERE config_id=?", (config_id,)
-            ).fetchone()
-        if not row:
-            return None
-        result = dict(row)
-        result["config"] = json.loads(result.pop("config_json", "{}"))
-        return result
+        row["scored"] = row["total_questions_graded"] - row["approved"] - row["needs_review"]
+        return dict(row)

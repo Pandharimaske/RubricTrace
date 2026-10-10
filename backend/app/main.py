@@ -7,7 +7,6 @@ from backend.app.api.routers.exams import router as exams_router
 from backend.app.api.routers.grading import router as grading_router
 from backend.app.api.routers.health import router as health_router
 from backend.app.api.routers.review import router as review_router
-from backend.app.api.routers.rubrics import router as rubrics_router
 from backend.app.api.routers.scripts import router as scripts_router
 from backend.app.api.routers.students import router as students_router
 from backend.app.container import Container
@@ -69,7 +68,6 @@ def create_app(container: Container | None = None) -> FastAPI:
         students_router,
         scripts_router,
         grading_router,
-        rubrics_router,
         review_router,
         exams_router,
     ):
