@@ -8,32 +8,46 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.20",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "structlog>=24.1",
+    "requests>=2.32",
+    "pandas>=2.2",
+    "numpy>=2.1",
+    "pillow>=11.0",
+    "pymupdf>=1.25",
+    "python-dotenv>=1.0",
+    "boto3>=1.35",
+    "psycopg[binary,pool]>=3.2",
+    "openai>=3.24.0",
 ]
+
+[tool.uv]
+package = false
 
 [dependency-groups]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    "httpx>=0.27",
     "hypothesis>=6.100",
     "ruff>=0.5",
     "mypy>=1.10",
     "pre-commit>=3.7",
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/rubrictrace"]
+# Only the paper's evaluation scripts need these (scripts/compute_grading_metrics.py):
+#   uv sync --group eval
+eval = [
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["app", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -50,21 +64,34 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]  # asserts are fine in tests
+# One-off evaluation/maintenance scripts: long report strings, zips over equal-length lists,
+# and SQL built from fixed fragments are fine here. Application code stays strict.
+"scripts/**" = ["E501", "B905", "S608", "RUF046"]
+# Prompt templates are long prose; wrapping them would change what the model sees.
+"app/extraction/prompt.py" = ["E501"]
+"app/grading/grader.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"
-strict = true
-mypy_path = "src"
-packages = ["rubrictrace"]
+# Imports are `backend.app...` (run from the repo root, or with pythonpath=".."), so mypy
+# needs the repo root on its path. Strict mode is off until the untyped corners are filled in;
+# untyped function bodies are still checked.
+mypy_path = ".."
+explicit_package_bases = true
+packages = ["backend.app"]
+check_untyped_defs = true
+warn_unused_ignores = false
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".."]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
 markers = [
-    "integration: needs external services (Postgres, Temporal); run in CI or via `just test-integration`",
+    "integration: needs external services",
 ]
 
 [tool.coverage.run]
-source = ["src/rubrictrace"]
+source = ["app"]
 branch = true

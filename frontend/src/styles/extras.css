@@ -1,0 +1,303 @@
+/* ============================================================
+   Additions on top of index.css: router links, utilities, toasts,
+   the exam stepper, the results grid and shared component styles.
+   ============================================================ */
+
+/* Links used as buttons / cards / nav items */
+a { color: inherit; }
+a.btn, a.card, a.nav-item, .logo { text-decoration: none; }
+a.card { display: block; }
+.nav-item { text-decoration: none; }
+
+/* Utilities that pages already used but were never defined */
+.mt-1 { margin-top: 4px; }
+.mt-2 { margin-top: 8px; }
+.mt-3 { margin-top: 12px; }
+.mb-1 { margin-bottom: 4px; }
+.gap-1 { gap: 4px; }
+.text-primary { color: var(--primary); }
+
+.spin { animation: spin 0.8s linear infinite; }
+
+/* Loading indicators keep moving even when other motion is reduced */
+@media (prefers-reduced-motion: reduce) {
+  .spinner, .spin {
+    animation-duration: 0.8s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/* Shared building blocks */
+.section-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+/* A scanned page sits on white, like the paper it came from */
+.crop-frame {
+  background: #fff;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 8px;
+  text-align: center;
+  overflow: auto;
+}
+
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.search-bar input {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+
+.search-bar input:focus { box-shadow: none; }
+
+.upload-zone:focus-visible { border-color: var(--primary); }
+
+/* Toasts: a white slip with a coloured edge */
+.toast-region {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 380px;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md);
+  font-size: 0.88rem;
+  animation: fadeIn 0.18s ease;
+}
+
+.toast > svg { flex-shrink: 0; margin-top: 2px; }
+.toast > span { flex: 1; }
+.toast-success { border-left-color: var(--success); }
+.toast-success > svg { color: var(--success); }
+.toast-error { border-left-color: var(--danger); }
+.toast-error > svg { color: var(--danger); }
+.toast-info { border-left-color: var(--info); }
+.toast-info > svg { color: var(--info); }
+
+.toast-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+}
+
+.toast-close:hover { color: var(--text-primary); }
+
+/* Exam workspace stepper: the order of work, left to right */
+.stepper {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  font-size: 0.88rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+  transition: color var(--transition);
+}
+
+.step:hover { color: var(--text-primary); }
+.step.active { color: var(--ink); font-weight: 600; border-bottom-color: var(--primary); }
+
+.step-dot {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  border: 1px solid var(--border-light);
+  background: var(--bg-surface);
+}
+
+.step.done .step-dot {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+.step.active:not(.done) .step-dot {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+/* Answer-key editor */
+.sticky-bar {
+  position: sticky;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  z-index: 5;
+}
+
+.criterion-row {
+  padding: 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-card-hover);
+}
+
+/* Job progress */
+.progress {
+  height: 6px;
+  background: var(--bg-elevated);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+/* Results grid: marks are numerals first, state second */
+.mark-cell {
+  display: inline-block;
+  min-width: 28px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-serif);
+  font-size: 1.02rem;
+  font-variant-numeric: lining-nums tabular-nums;
+  color: var(--ink);
+}
+
+/* Awaiting the teacher: double-underlined, as a pen would flag it */
+.mark-review {
+  color: var(--warning-light);
+  background: var(--warning-bg);
+  text-decoration: underline double;
+  text-decoration-color: var(--warning);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+}
+
+.mark-approved {
+  color: var(--success-light);
+  background: var(--success-bg);
+}
+
+.results-table .sticky-col {
+  position: sticky;
+  left: 0;
+  background: var(--bg-surface);
+  z-index: 1;
+  box-shadow: 1px 0 0 var(--border);
+}
+
+.results-table tbody tr:hover .sticky-col { background: var(--bg-card-hover); }
+
+/* Confidence threshold slider */
+.confidence-threshold-slider {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+
+.confidence-threshold-slider.compact { padding: 12px; }
+
+.slider-container {
+  position: relative;
+  margin: 12px 0;
+}
+
+.confidence-slider {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-light);
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+
+.confidence-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: 3px solid #fff;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px var(--primary), var(--shadow-sm);
+  transition: transform var(--transition);
+}
+
+.confidence-slider::-webkit-slider-thumb:hover { transform: scale(1.1); }
+
+.confidence-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary);
+  cursor: pointer;
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 1px var(--primary), var(--shadow-sm);
+}
+
+.confidence-slider:focus-visible { outline: 2px solid var(--primary); outline-offset: 6px; }
+
+.confidence-slider:disabled { opacity: 0.5; cursor: not-allowed; }
+.confidence-slider:disabled::-webkit-slider-thumb { box-shadow: 0 0 0 1px var(--text-disabled); }
+.confidence-slider:disabled::-moz-range-thumb { box-shadow: 0 0 0 1px var(--text-disabled); }
+
+/* The page scrubber in the review modal uses the browser's range input */
+input[type='range'] { accent-color: var(--primary); }
+
+.slider-labels {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+  padding: 0 2px;
+}
