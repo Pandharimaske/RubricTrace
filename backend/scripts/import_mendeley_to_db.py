@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import uuid
@@ -43,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 import pymupdf
+from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -60,6 +62,7 @@ from backend.app.models.domain import (
     QuestionSpec,
     normalize_question_type,
 )
+from backend.app.models.schemas import ExamUpdate
 
 STUDENT_PDF_DIR = (
     PROJECT_ROOT
@@ -85,22 +88,62 @@ def _question_number(question_id: str) -> int | None:
     return int(digits) if digits.isdigit() else None
 
 
+def _criterion_name_and_guidance(criterion: dict[str, Any]) -> tuple[str, str]:
+    """A criterion's short name and its guidance, split the way the app splits a rubric it is
+    given as JSON: ``"<name> — <how to mark it>"``, else the first 80 characters as the name."""
+    text = str(criterion.get("criterion") or criterion.get("name") or "").strip()
+    guidance = str(criterion.get("guidance") or "")
+    if " — " in text:
+        name, _, rest = text.partition(" — ")
+        return name.strip(), guidance or rest.strip()
+    name = text[:80].strip()
+    return name, guidance or (text if text != name else "")
+
+
 def _criteria(rubric: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The benchmark's rubric entries in the shape the answer key stores. A criterion has to be
-    worth some marks, so zero-mark entries are dropped."""
-    criteria = []
+    """The benchmark's rubric entries (``criterion`` / ``points``) as answer-key criteria. A
+    criterion has to be worth some marks, so zero-mark entries are dropped."""
+    criteria: list[dict[str, Any]] = []
     for c in rubric:
-        marks = float(c.get("marks", c.get("max_marks", 0)) or 0)
+        marks = float(c.get("points", c.get("marks", 0)) or 0)
         if marks > 0:
+            name, guidance = _criterion_name_and_guidance(c)
             criteria.append(
                 {
-                    "name": c.get("name") or c.get("criterion") or "",
+                    "name": name or f"Criterion {len(criteria) + 1}",
                     "marks": marks,
                     "expected_concepts": list(c.get("expected_concepts") or []),
-                    "guidance": c.get("guidance") or "",
+                    "guidance": guidance,
                 }
             )
     return criteria
+
+
+_OPTION_LINE = re.compile(r"^\s*\(?([A-Za-z])[.)]\s+(\S.*?)\s*$")
+
+
+def _split_mcq(question_text: str, golden_answer: str) -> tuple[str, list[dict[str, Any]]]:
+    """The stem and the options of an MCQ whose options are written into its text, one per
+    line ("A. Little or no autocorrelation"). The option matching the golden letter is correct."""
+    stem: list[str] = []
+    options: list[dict[str, Any]] = []
+    for line in question_text.splitlines():
+        match = _OPTION_LINE.match(line)
+        if match:
+            key = match.group(1).upper()
+            options.append(
+                {
+                    "option_key": key,
+                    "option_text": match.group(2),
+                    "is_correct": key == golden_answer.strip().upper(),
+                    "display_order": len(options),
+                }
+            )
+        elif not options:
+            stem.append(line)
+        elif line.strip():  # an option that wraps onto a second line
+            options[-1]["option_text"] += " " + line.strip()
+    return "\n".join(stem).strip(), options
 
 
 def _build_question_bank(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -112,15 +155,48 @@ def _build_question_bank(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if qid in bank:
             continue
         qtype = normalize_question_type(r.get("question_type"))
+        qtype = qtype if qtype in QUESTION_TYPES else "short_answer"
+        text = r.get("question_text", "")
+        golden = r.get("golden_answer", "")
+        options: list[dict[str, Any]] = []
+        criteria: list[dict[str, Any]] = []
+        if qtype == "mcq":
+            text, options = _split_mcq(text, golden)
+        elif qtype != "true_false":
+            criteria = _criteria(r.get("rubric") or [])
         bank[qid] = {
             "question_id": qid,
-            "question_text": r.get("question_text", ""),
-            "golden_answer": r.get("golden_answer", ""),
-            "question_type": qtype if qtype in QUESTION_TYPES else "short_answer",
+            "question_text": text,
+            "golden_answer": golden,
+            "question_type": qtype,
             "max_marks": r["max_marks"],
-            "criteria": _criteria(r.get("rubric") or []),
+            "options": options,
+            "criteria": criteria,
         }
     return [bank[qid] for qid in sorted(bank, key=lambda q: _question_number(q) or 0)]
+
+
+def _validated(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Check the key against the app's own rules (the ones the answer-key editor enforces) and
+    return it in the stored shape. Stops with a readable list if anything doesn't conform, rather
+    than saving a key the editor would then refuse."""
+    # Question by question, so every problem is listed at once instead of one per run.
+    problems: list[str] = []
+    for q in questions:
+        try:
+            ExamUpdate.model_validate({"questions": [q]})
+        except ValidationError as exc:
+            for err in exc.errors():
+                msg = str(err["msg"]).removeprefix("Value error, ")
+                msg = msg.removeprefix(f"{q['question_id']}: ")  # the app's message may name it
+                problems.append(f"  {q['question_id']}: {msg}")
+    if problems:
+        raise SystemExit(
+            "The answer key built from the results file does not meet the app's rules:\n"
+            + "\n".join(problems)
+        )
+    update = ExamUpdate.model_validate({"questions": questions})
+    return [q.model_dump() for q in update.questions or []]
 
 
 def _load_pages(index_path: Path) -> dict[tuple[str, str], int]:
@@ -215,7 +291,7 @@ def main() -> None:
         exam_id = str((existing or exams.create(args.exam_name))["exam_id"])
         print(f"Exam: {args.exam_name!r} ({exam_id})", flush=True)
 
-        questions = _build_question_bank(results)
+        questions = _validated(_build_question_bank(results))
         # The review threshold is part of the exam's configuration; use the one the grading
         # run used so the imported exam flags what the benchmark flagged.
         review_threshold = args.review_threshold
