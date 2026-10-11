@@ -1,7 +1,7 @@
 import React from 'react'
 import { Link } from 'react-router-dom'
 import {
-  Activity, Users, FileText, AlertTriangle, CheckCircle, Brain, TrendingUp, ClipboardList,
+  Activity, Users, FileText, AlertTriangle, CheckCircle, Brain, ClipboardList,
 } from 'lucide-react'
 import { useStats, useScripts } from '../hooks/queries'
 import { paths } from '../lib/routes'
@@ -73,9 +73,6 @@ function DashboardBody({ stats, recent }) {
             <Link to={paths.review} className="btn btn-secondary">
               <AlertTriangle size={16} /> Open Review Queue
             </Link>
-            <Link to={paths.rubrics} className="btn btn-ghost">
-              <TrendingUp size={16} /> Manage Rubric Configs
-            </Link>
           </div>
         </div>
 
@@ -85,7 +82,7 @@ function DashboardBody({ stats, recent }) {
             <EmptyState
               icon="📄"
               title="No scripts yet"
-              description="Upload a student PDF to get started."
+              description="Create an exam and upload your students' scripts to it."
             />
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

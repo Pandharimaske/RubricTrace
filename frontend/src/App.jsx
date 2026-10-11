@@ -3,24 +3,20 @@ import {
   Routes, Route, NavLink, Link, Navigate, useLocation, useOutletContext, useParams,
 } from 'react-router-dom'
 import {
-  LayoutDashboard, ClipboardList, Users, FileText, CheckSquare, BookOpen,
+  LayoutDashboard, ClipboardList, Users, FileText, CheckSquare,
 } from 'lucide-react'
 import { useHealth, useScript, useStats } from './hooks/queries'
-import { useLegacyNavigate } from './hooks/useLegacyNavigate'
 import { nextStep } from './lib/exam'
 import { paths } from './lib/routes'
 import { guardNavigation } from './lib/unsaved'
 import ErrorBoundary from './components/ErrorBoundary'
 import { EmptyState, QueryGate } from './components/ui'
 import Dashboard from './pages/Dashboard'
-import UploadPage from './pages/Upload'
 import StudentsPage from './pages/Students'
 import StudentDetail from './pages/StudentDetail'
 import ScriptsPage from './pages/Scripts'
-import ScriptDetail from './pages/ScriptDetail'
 import ScriptResult from './pages/ScriptResult'
 import ReviewQueue from './pages/ReviewQueue'
-import RubricConfigs from './pages/RubricConfigs'
 import ExamsPage from './pages/Exams'
 import ExamWorkspace from './pages/ExamWorkspace'
 import ExamRubric from './pages/exam/ExamRubric'
@@ -29,28 +25,15 @@ import ExamGrade from './pages/exam/ExamGrade'
 import ExamReview from './pages/exam/ExamReview'
 import ExamResults from './pages/exam/ExamResults'
 
-// Scripts in an exam get the new paper view; older standalone scripts keep the
-// original page (which still has its own per-script rubric builder).
+// Every script belongs to an exam, so there is one script page.
 function ScriptRoute() {
   const { scriptId } = useParams()
-  const navigate = useLegacyNavigate()
   const query = useScript(scriptId)
   return (
     <QueryGate query={query} loadingLabel="Loading script…">
-      {(data) =>
-        data.script.exam_id ? (
-          <ScriptResult data={data} />
-        ) : (
-          <ScriptDetail key={scriptId} navigate={navigate} scriptId={scriptId} />
-        )
-      }
+      {(data) => <ScriptResult data={data} />}
     </QueryGate>
   )
-}
-
-function RubricConfigsRoute() {
-  const navigate = useLegacyNavigate()
-  return <RubricConfigs navigate={navigate} />
 }
 
 // /exams/:id lands on whichever step needs doing next.
@@ -96,13 +79,15 @@ export default function App() {
                 <Route path="review" element={<ExamReview />} />
                 <Route path="results" element={<ExamResults />} />
               </Route>
-              <Route path="/upload" element={<UploadPage />} />
               <Route path="/students" element={<StudentsPage />} />
               <Route path="/students/:studentId" element={<StudentDetail />} />
               <Route path="/scripts" element={<ScriptsPage />} />
               <Route path="/scripts/:scriptId" element={<ScriptRoute />} />
               <Route path="/review" element={<ReviewQueue />} />
-              <Route path="/rubrics" element={<RubricConfigsRoute />} />
+              {/* Old bookmarks: scripts are uploaded inside an exam and every exam has its
+                  own answer key, so the standalone upload and rubric-template pages are gone. */}
+              <Route path="/upload" element={<Navigate to={paths.exams} replace />} />
+              <Route path="/rubrics" element={<Navigate to={paths.exams} replace />} />
               <Route path="*" element={<NotFound />} />
             </Routes>
           </ErrorBoundary>
@@ -124,9 +109,8 @@ const NAV_SECTIONS = [
   {
     label: 'Library',
     items: [
-      { to: paths.scripts,  label: 'All Scripts',     icon: FileText },
-      { to: paths.students, label: 'Students',        icon: Users },
-      { to: paths.rubrics,  label: 'Rubric Templates', icon: BookOpen },
+      { to: paths.scripts,  label: 'All Scripts', icon: FileText },
+      { to: paths.students, label: 'Students',    icon: Users },
     ],
   },
 ]

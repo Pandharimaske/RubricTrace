@@ -346,3 +346,23 @@ def test_descriptive_marks_snap_to_the_exams_mark_step(
 
     assert whole["awarded"] == 1.0  # whole marks by default
     assert half["awarded"] == 1.5
+
+
+def test_the_all_scripts_list_shows_graded_state_not_just_pipeline_state(
+    client: TestClient, exam_id: str
+) -> None:
+    _upload(client, exam_id)
+    before = client.get("/api/scripts").json()["scripts"][0]
+    client.post(f"/api/exams/{exam_id}/process")
+    _wait_for_job(client, exam_id)
+    client.post(f"/api/exams/{exam_id}/grade")
+    _wait_for_job(client, exam_id)
+
+    after = client.get("/api/scripts").json()["scripts"][0]
+
+    assert before["status"] == "uploaded"
+    assert after["pipeline_status"] == "processed"
+    assert after["status"] == ("needs_review" if after["needs_review_count"] else "graded")
+    assert after["graded_questions"] == 2
+    assert after["exam_id"] == exam_id
+    assert after["exam_name"]

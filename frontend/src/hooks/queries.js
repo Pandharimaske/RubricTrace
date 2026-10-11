@@ -11,7 +11,6 @@ export const keys = {
   students: ['students'],
   student: (id) => ['students', id],
   reviewQueue: ['review-queue'],
-  rubrics: ['rubric-configs'],
   // Everything about one exam nests under ['exams', id, ...] so one
   // invalidation of keys.exam(id) refreshes summary, scripts, results and job.
   exams: ['exams'],
@@ -243,39 +242,6 @@ export function useCancelJob(examId) {
   return useMutation({
     mutationFn: () => api.exams.cancelJob(examId),
     onSuccess: () => invalidate(keys.examJob(examId)),
-  })
-}
-
-/**
- * Upload then process one script in a single request. Used by the standalone
- * Upload page; exams use useUploadToExam + a background process job instead.
- * If upload succeeds but processing fails, the script still exists, so we
- * return `processError` instead of throwing.
- */
-export function useUploadScript() {
-  const invalidate = useInvalidate()
-  return useMutation({
-    mutationFn: async ({ file, studentId, studentName, onStage }) => {
-      const fd = new FormData()
-      fd.append('file', file)
-      if (studentId) fd.append('student_id', studentId)
-      if (studentName) fd.append('student_name', studentName)
-
-      onStage?.('uploading')
-      const upload = await api.scripts.upload(fd)
-
-      onStage?.('processing')
-      let process = null
-      let processError = null
-      try {
-        process = await api.scripts.process(upload.script_id)
-      } catch (e) {
-        processError = e.message
-      }
-      const questionIds = Object.keys(process?.extraction?.questions || {})
-      return { upload, process, processError, questionIds }
-    },
-    onSettled: () => invalidate(keys.scripts, keys.students, keys.stats),
   })
 }
 

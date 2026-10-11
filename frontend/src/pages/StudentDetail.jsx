@@ -1,6 +1,6 @@
 import React from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { FileText, ChevronRight, Upload, Calendar } from 'lucide-react'
+import { FileText, ChevronRight, Calendar } from 'lucide-react'
 import { useStudent } from '../hooks/queries'
 import { paths } from '../lib/routes'
 import { PageHeader, QueryGate, StatusBadge, EmptyState } from '../components/ui'
@@ -24,8 +24,6 @@ export default function StudentDetail() {
 }
 
 function StudentBody({ student, scripts }) {
-  const uploadHref = paths.upload(student.student_id)
-
   return (
     <>
       <div className="card mb-4" style={{ padding: 24 }}>
@@ -53,9 +51,6 @@ function StudentBody({ student, scripts }) {
               </div>
             </div>
           </div>
-          <Link to={uploadHref} className="btn btn-primary">
-            <Upload size={14} /> Upload Script
-          </Link>
         </div>
       </div>
 
@@ -65,13 +60,9 @@ function StudentBody({ student, scripts }) {
         <div className="card">
           <EmptyState
             icon={<FileText size={36} />}
-            title="No scripts uploaded yet"
-            description="Upload a scanned PDF for this student to start segmentation and grading."
-            action={
-              <Link to={uploadHref} className="btn btn-primary">
-                <Upload size={14} /> Upload First Script
-              </Link>
-            }
+            title="No scripts yet"
+            description="Scripts are uploaded from an exam's Scripts tab."
+            action={<Link to={paths.exams} className="btn btn-primary">Go to exams</Link>}
           />
         </div>
       ) : (
@@ -80,6 +71,7 @@ function StudentBody({ student, scripts }) {
             <thead>
               <tr>
                 <th>File / Script</th>
+                <th>Exam</th>
                 <th>Status</th>
                 <th>Pages</th>
                 <th>Uploaded</th>
@@ -97,6 +89,11 @@ function StudentBody({ student, scripts }) {
                         <div className="font-mono text-xs text-muted">{s.script_id}</div>
                       </div>
                     </div>
+                  </td>
+                  <td className="text-sm">
+                    <Link to={paths.exam(s.exam_id)} style={{ color: 'var(--text-primary)', textDecoration: 'none' }}>
+                      {s.exam_name}
+                    </Link>
                   </td>
                   <td><StatusBadge status={s.status} /></td>
                   <td className="text-sm">{s.page_count ?? '—'}</td>

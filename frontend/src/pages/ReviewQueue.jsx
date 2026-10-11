@@ -77,7 +77,7 @@ function QueueBody({ items, activeKey, setActiveKey }) {
         <table>
           <thead>
             <tr>
-              <th>Crop</th>
+              <th>Page</th>
               <th>Student</th>
               <th>Question</th>
               <th>AI Marks</th>

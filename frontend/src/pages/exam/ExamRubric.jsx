@@ -9,6 +9,13 @@ import { paths } from '../../lib/routes'
 
 const DEFAULT_THRESHOLD = 0.65
 
+// How finely written answers are marked. Multiples of this; objective questions are unaffected.
+const MARK_STEPS = [
+  [1, 'Whole marks'],
+  [0.5, 'Half marks'],
+  [0.25, 'Quarter marks'],
+]
+
 export default function ExamRubric() {
   const { exam } = useOutletContext()
   const save = useSaveExam(exam.exam_id)
@@ -20,6 +27,13 @@ export default function ExamRubric() {
   const savedThreshold = exam.review_confidence_threshold ?? DEFAULT_THRESHOLD
   const [threshold, setThreshold] = useState(savedThreshold)
   const thresholdChanged = Math.abs(threshold - savedThreshold) > 0.001
+
+  const savedStep = Number(exam.mark_step ?? 1)
+  const [step, setStep] = useState(savedStep)
+  const stepChanged = step !== savedStep
+  const stepOptions = MARK_STEPS.some(([value]) => value === savedStep)
+    ? MARK_STEPS
+    : [...MARK_STEPS, [savedStep, `${savedStep} marks`]]
 
   // Saving the answer key also saves the threshold, so the two can never drift apart.
   function onSave(questions) {
@@ -41,6 +55,16 @@ export default function ExamRubric() {
       { review_confidence_threshold: threshold },
       {
         onSuccess: () => toast.success(`Review threshold set to ${Math.round(threshold * 100)}%`),
+        onError: (err) => toast.error(err.message),
+      },
+    )
+  }
+
+  function saveStep() {
+    save.mutate(
+      { mark_step: step },
+      {
+        onSuccess: () => toast.success('Marking step saved'),
         onError: (err) => toast.error(err.message),
       },
     )
@@ -92,6 +116,46 @@ export default function ExamRubric() {
             </button>
           </div>
         </div>
+      </div>
+
+      <div className="card mb-4">
+        <h3 className="card-title mb-3">Marking step</h3>
+        <p className="text-sm text-muted mb-3">
+          Written answers are awarded in multiples of this: the model's marks are rounded to the
+          nearest step. Multiple-choice and true/false questions are unaffected.
+        </p>
+        <div className="flex items-center gap-2">
+          <select
+            className="form-select"
+            style={{ width: 'auto' }}
+            aria-label="Marking step"
+            value={step}
+            onChange={(e) => setStep(Number(e.target.value))}
+            disabled={save.isPending}
+          >
+            {stepOptions.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+          {stepChanged && (
+            <button className="btn btn-ghost btn-sm" onClick={() => setStep(savedStep)} disabled={save.isPending}>
+              Undo
+            </button>
+          )}
+          <button className="btn btn-secondary btn-sm" onClick={saveStep} disabled={!stepChanged || save.isPending}>
+            <Save size={14} /> Save step
+          </button>
+        </div>
+        {exam.graded_count > 0 && stepChanged && (
+          <div className="alert alert-warning mt-3">
+            <AlertTriangle size={16} />
+            <div>
+              This applies to answers graded from now on. To apply it to the {exam.graded_count} script
+              {exam.graded_count > 1 ? 's' : ''} already graded, use "Re-grade everything" on the Grade
+              tab. Marks you approved are kept.
+            </div>
+          </div>
+        )}
       </div>
 
       <RubricEditor

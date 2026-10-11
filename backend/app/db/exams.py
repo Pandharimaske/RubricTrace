@@ -291,7 +291,8 @@ class ExamRepository:
                            ss.graded_questions, ss.total_awarded, ss.total_max,
                            ss.needs_review_count,
                            (select count(*) from extractions x
-                             where x.script_id = ss.script_id)::int as extraction_count
+                             where x.script_id = ss.script_id
+                               and x.answer_state <> 'not_found')::int as extraction_count
                     from script_summary ss join students st on st.id = ss.student_id
                     where ss.exam_id = %s
                     order by lower(st.name), ss.created_at
@@ -312,7 +313,7 @@ class ExamRepository:
             evaluation_rows = c.execute(
                 """
                 select es.script_id, q.question_id, es.final_marks as awarded,
-                       es.max_marks as max, es.confidence,
+                       es.ai_marks as ai, es.max_marks as max, es.confidence,
                        case when es.review_status = 'teacher_approved' then 'teacher_approved'
                             when es.needs_review then 'needs_review'
                             else 'scored' end as status
@@ -328,6 +329,7 @@ class ExamRepository:
         for r in evaluation_rows:
             marks_by_script.setdefault(r["script_id"], {})[r["question_id"]] = {
                 "awarded": r["awarded"],
+                "ai": r["ai"],
                 "max": r["max"],
                 "status": r["status"],
                 "confidence": r["confidence"],

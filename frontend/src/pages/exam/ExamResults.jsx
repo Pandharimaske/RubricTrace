@@ -27,8 +27,13 @@ function Cell({ mark }) {
   if (!mark) return <span className="text-muted">–</span>
   const tone =
     mark.status === 'needs_review' ? 'mark-review' : mark.status === 'teacher_approved' ? 'mark-approved' : ''
+  const base = TITLES[mark.status] || mark.status
+  const title =
+    mark.status === 'teacher_approved' && mark.ai != null && mark.ai !== mark.awarded
+      ? `${base} (the AI awarded ${mark.ai})`
+      : base
   return (
-    <span className={`mark-cell ${tone}`} title={TITLES[mark.status] || mark.status}>
+    <span className={`mark-cell ${tone}`} title={title}>
       {mark.awarded}
     </span>
   )

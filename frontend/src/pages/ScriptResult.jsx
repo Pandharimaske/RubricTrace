@@ -86,8 +86,13 @@ function QuestionCard({ scriptId, pageCount, question_id: qid, extraction, evalu
         {ev ? (
           <div className="flex items-center gap-4">
             <ConfidenceBar value={ev.confidence} />
-            <div style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--text-primary)' }}>
-              {ev.awarded_marks} <span className="text-muted" style={{ fontSize: '0.85rem' }}>/ {ev.max_marks}</span>
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: '1.2rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                {ev.awarded_marks} <span className="text-muted" style={{ fontSize: '0.85rem' }}>/ {ev.max_marks}</span>
+              </div>
+              {ev.teacher_override != null && (
+                <div className="text-xs text-muted">AI awarded {ev.ai_marks}</div>
+              )}
             </div>
           </div>
         ) : (
@@ -109,15 +114,23 @@ function QuestionCard({ scriptId, pageCount, question_id: qid, extraction, evalu
           <div className="mb-2">
             <PageSlider scriptId={scriptId} answerPage={answerPage} pageCount={pageCount} />
           </div>
-          <div className="reasoning-block">{answerText || <span className="text-muted">(no text extracted)</span>}</div>
+          <div className="reasoning-block">
+            {answerText || (
+              <span className="text-muted">
+                {extraction?.answer_state === 'not_found'
+                  ? '(not found on any page)'
+                  : '(no text extracted)'}
+              </span>
+            )}
+          </div>
         </div>
 
         {ev && (
           <div>
             <SectionLabel><Brain size={12} style={{ display: 'inline', marginRight: 4 }} />Why these marks</SectionLabel>
-            {flagged && ev.llm_reasoning?.flag_reasons?.length > 0 && (
+            {flagged && ev.flag_reasons?.length > 0 && (
               <div className="text-xs mb-2" style={{ color: 'var(--warning-light)' }}>
-                Flagged: {ev.llm_reasoning.flag_reasons.join(' · ')}
+                Flagged: {ev.flag_reasons.join(' · ')}
               </div>
             )}
             <div className="reasoning-block mb-2">{ev.reasoning || <span className="text-muted">(no reasoning recorded)</span>}</div>

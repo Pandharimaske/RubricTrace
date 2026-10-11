@@ -1,11 +1,11 @@
 import React, { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { FileText, ChevronRight, Search, Upload } from 'lucide-react'
+import { ClipboardList, FileText, ChevronRight, Search } from 'lucide-react'
 import { useScripts } from '../hooks/queries'
 import { paths } from '../lib/routes'
 import { PageHeader, QueryGate, StatusBadge, EmptyState } from '../components/ui'
 
-const STATUS_OPTIONS = ['uploaded', 'processed', 'graded', 'needs_review', 'teacher_approved']
+const STATUS_OPTIONS = ['uploaded', 'processing', 'processed', 'error', 'graded', 'needs_review']
 
 export default function ScriptsPage() {
   const scripts = useScripts()
@@ -16,10 +16,10 @@ export default function ScriptsPage() {
     <div>
       <PageHeader
         title="Scripts"
-        description="All uploaded student answer scripts."
+        description="Every student script, across all exams. Upload new ones from an exam's Scripts tab."
         actions={
-          <Link to={paths.upload()} className="btn btn-primary">
-            <Upload size={16} /> Upload New
+          <Link to={paths.exams} className="btn btn-primary">
+            <ClipboardList size={16} /> Go to exams
           </Link>
         }
       />
@@ -63,7 +63,7 @@ function ScriptsTable({ scripts, search, status }) {
       .filter(
         (s) =>
           !q ||
-          [s.filename, s.student_id, s.student_name].some((v) => v?.toLowerCase().includes(q)),
+          [s.filename, s.student_id, s.student_name, s.exam_name].some((v) => v?.toLowerCase().includes(q)),
       )
   }, [scripts, search, status])
 
@@ -73,7 +73,7 @@ function ScriptsTable({ scripts, search, status }) {
       <EmptyState
         icon={<FileText size={48} />}
         title={filtered ? 'No matching scripts' : 'No scripts uploaded yet'}
-        description={filtered ? 'Try a different search or filter.' : 'Upload a PDF to begin grading.'}
+        description={filtered ? 'Try a different search or filter.' : 'Open an exam and upload its scripts to begin grading.'}
       />
     )
   }
@@ -85,6 +85,7 @@ function ScriptsTable({ scripts, search, status }) {
           <tr>
             <th>Filename</th>
             <th>Student</th>
+            <th>Exam</th>
             <th>Pages</th>
             <th>Status</th>
             <th>Uploaded</th>
@@ -101,6 +102,11 @@ function ScriptsTable({ scripts, search, status }) {
                 </Link>
               </td>
               <td className="text-sm">{s.student_name || s.student_id}</td>
+              <td className="text-sm">
+                <Link to={paths.exam(s.exam_id)} style={{ color: 'var(--text-primary)', textDecoration: 'none' }}>
+                  {s.exam_name}
+                </Link>
+              </td>
               <td>{s.page_count ?? '—'}</td>
               <td><StatusBadge status={s.status} /></td>
               <td className="text-xs text-muted">{s.created_at?.slice(0, 10)}</td>

@@ -90,16 +90,8 @@ export const api = {
     process:   (id)           => post(`/scripts/${id}/process`, {}),
     extractions:(id)           => get(`/scripts/${id}/extractions`),
     pageImageUrl: (id, pageNumber) => `${BASE}/scripts/${id}/pages/${pageNumber}/image`,
-    evaluate:  (id, body)     => post(`/scripts/${id}/evaluate`, body),
     evaluation:(id)           => get(`/scripts/${id}/evaluation`),
     override:  (id, body)     => post(`/scripts/${id}/override`, body),
-  },
-
-  // Rubric configs (reusable templates)
-  rubricConfigs: {
-    list:   ()     => get('/rubric-configs'),
-    save:   (body) => post('/rubric-configs', body),
-    get:    (id)   => get(`/rubric-configs/${id}`),
   },
 
   // Review Queue (optionally limited to one exam)

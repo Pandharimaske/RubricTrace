@@ -88,16 +88,22 @@ class StudentRepository:
 _SCRIPT_SELECT = """
     select sc.id as script_id, st.external_id as student_id, st.name as student_name,
            sc.exam_id, e.name as exam_name, sc.filename, sc.storage_key,
-           sc.status::text as status, sc.page_count, sc.error, sc.created_at
+           ss.status, sc.status::text as pipeline_status, ss.graded_questions,
+           ss.needs_review_count, sc.page_count, sc.error, sc.created_at
     from scripts sc
     join students st on st.id = sc.student_id
     join exams e on e.id = sc.exam_id
+    join script_summary ss on ss.script_id = sc.id
 """
 
 
 class ScriptRepository:
     """Uploaded scripts. The row stores an object key; the local processing copy lives at
-    ``upload_dir/<script_id><suffix>``, which is what ``file_path`` points at."""
+    ``upload_dir/<script_id><suffix>``, which is what ``file_path`` points at.
+
+    ``status`` in the rows returned here is the derived one (uploaded / processing / processed /
+    error, then graded or needs_review once it has grades); ``pipeline_status`` is the stored
+    pipeline state alone."""
 
     def __init__(self, db: Database, upload_dir: Path) -> None:
         self.db = db
