@@ -1,49 +1,65 @@
 #!/usr/bin/env python3
 """
 Import the already-graded Mendeley benchmark (50 students, results_merged.json)
-into RubricTrace's real database, so the whole benchmark — exam, answer key,
-all 50 students' scripts, every question's extracted answer and grade — shows
-up in the normal frontend (Exams -> this exam -> Scripts / Review / Results),
-exactly like a real class exam would.
+into RubricTrace's database, so the whole benchmark -- exam, answer key, all 50
+students' scripts, every question's extracted answer and grade -- shows up in the normal
+frontend (Exams -> this exam -> Scripts / Review / Results), like a real class exam.
 
-Why this is needed: grade_mcq_local.py / grade_short_answer_cloud.py /
-merge_grading_results.py only ever write to data/processed/*.json. Nothing in
-that pipeline touches the students/scripts/question_extractions/question_evaluations
-tables the frontend actually reads from (see backend/app/db/database.py,
-backend/app/db/exams.py, and the scripts router). This
-script is the missing bridge.
+Why this is needed: grade_mcq.py / grade_short_answer_cloud.py / merge_grading_results.py
+only ever write to data/processed/*.json. Nothing in that pipeline touches the database the
+frontend reads from. This script is the bridge.
 
-Idempotent: re-running finds the exam by name (instead of creating a
-duplicate) and upserts everything under it, so it's safe to re-run after a
-fresh grading pass.
+What it does, per student:
+  * copies the student's PDF into the upload directory under a stable id, so the page viewer
+    and "Process" work exactly as for a real upload (page images render on first view);
+  * records the extracted answer text, with the page it came from when
+    data/processed/extracted_answers_index.json has it;
+  * stores the benchmark's grade as an AI grade (ai_marks = final_marks).
+
+Review state follows the exam's threshold, like any grade: an answer is flagged when its
+confidence is below the threshold the benchmark run used (which is copied onto the exam). A
+record the benchmark flagged for another reason is kept flagged with that reason.
+
+Idempotent: re-running finds the exam by name and the scripts by their stable ids, and updates
+the grades under them. Marks a teacher has approved in the app are never overwritten.
 
 Usage:
     python scripts/import_mendeley_to_db.py
     python scripts/import_mendeley_to_db.py --merged data/processed/results_merged.json \
         --exam-name "Mendeley Benchmark — 50 Students"
 
-Known gap: this does NOT populate PAGE_IMAGE_DIR, because the offline batch
-pipeline (grade_mcq_local.py etc.) never rendered/stored page images — it read
-straight from data/raw/extracted_answers/. So GET /scripts/{id}/pages/{n}/image
-will 404 for these scripts; every question's extracted TEXT (via question_extractions)
-and grade (via question_evaluations) will still show correctly everywhere else.
+The review threshold is taken from the results file's summary when it records one. Pass
+--review-threshold to set it explicitly (use the value your grading run used).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
+import pymupdf
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.core.config import PROCESSED_DIR, PROJECT_ROOT
-from backend.app.db.database import default_database, get_db
+from backend.app.core.config import PROCESSED_DIR, PROJECT_ROOT, settings
+from backend.app.db.database import Database
 from backend.app.db.exams import ExamRepository
-
-EXAMS = ExamRepository(default_database)
+from backend.app.db.repositories import (
+    EvaluationRepository,
+    ExtractionRepository,
+    ScriptRepository,
+)
+from backend.app.models.domain import (
+    QUESTION_TYPES,
+    GradeResult,
+    QuestionSpec,
+    normalize_question_type,
+)
 
 STUDENT_PDF_DIR = (
     PROJECT_ROOT
@@ -56,13 +72,35 @@ STUDENT_PDF_DIR = (
 )
 
 EXAM_NAME_DEFAULT = "Mendeley Benchmark — 50 Students"
+SOURCE = "mendeley_offline_batch"
 
 
-def _find_or_create_exam(name: str) -> str:
-    existing = EXAMS.find_by_name(name)
-    if existing:
-        return str(existing["exam_id"])
-    return str(EXAMS.create(name)["exam_id"])
+def _script_id(exam_id: str, student_id: str) -> str:
+    """Stable per (exam, student), so a re-run updates the same rows."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"rubrictrace:{exam_id}:{student_id}"))
+
+
+def _question_number(question_id: str) -> int | None:
+    digits = question_id[1:]
+    return int(digits) if digits.isdigit() else None
+
+
+def _criteria(rubric: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The benchmark's rubric entries in the shape the answer key stores. A criterion has to be
+    worth some marks, so zero-mark entries are dropped."""
+    criteria = []
+    for c in rubric:
+        marks = float(c.get("marks", c.get("max_marks", 0)) or 0)
+        if marks > 0:
+            criteria.append(
+                {
+                    "name": c.get("name") or c.get("criterion") or "",
+                    "marks": marks,
+                    "expected_concepts": list(c.get("expected_concepts") or []),
+                    "guidance": c.get("guidance") or "",
+                }
+            )
+    return criteria
 
 
 def _build_question_bank(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -73,15 +111,73 @@ def _build_question_bank(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         qid = r["question_id"]
         if qid in bank:
             continue
+        qtype = normalize_question_type(r.get("question_type"))
         bank[qid] = {
             "question_id": qid,
             "question_text": r.get("question_text", ""),
             "golden_answer": r.get("golden_answer", ""),
-            "question_type": r.get("question_type", ""),
+            "question_type": qtype if qtype in QUESTION_TYPES else "short_answer",
             "max_marks": r["max_marks"],
-            "criteria": r.get("rubric", []) or [],
+            "criteria": _criteria(r.get("rubric") or []),
         }
-    return [bank[qid] for qid in sorted(bank, key=lambda q: int(q[1:]))]
+    return [bank[qid] for qid in sorted(bank, key=lambda q: _question_number(q) or 0)]
+
+
+def _load_pages(index_path: Path) -> dict[tuple[str, str], int]:
+    """(student_id, question_id) -> page, from the VLM extraction index when it exists."""
+    if not index_path.is_file():
+        print(f"No page index at {index_path}; answers will not link to a page.", flush=True)
+        return {}
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    records = payload.get("results", payload)
+    return {
+        (r["student_id"], r["question_id"]): int(r["page_number"])
+        for r in records
+        if r.get("page_number") is not None
+    }
+
+
+def _grade_result(
+    record: dict[str, Any], spec: QuestionSpec, page: int | None, threshold: float
+) -> tuple[GradeResult, list[str]]:
+    """The benchmark's grade as a GradeResult, plus the rule-based flags to store with it."""
+    is_mcq = spec.question_type == "mcq"
+    confidence = float(record.get("confidence") or 0.0)
+    review_reason = record.get("review_reason") or ""
+    reasoning = record.get("reasoning") or (review_reason if is_mcq else "")
+    evidence = record.get("evidence") or ([review_reason] if is_mcq and review_reason else [])
+
+    # Confidence flags are derived from the threshold when a grade is read. Anything the
+    # benchmark flagged beyond that is kept as an explicit reason.
+    rule_flags: list[str] = []
+    if record.get("needs_review") and confidence >= threshold:
+        rule_flags = [review_reason or "Flagged by the benchmark grading run."]
+
+    result = GradeResult(
+        question_id=spec.question_id,
+        question_text=spec.question_text,
+        question_type=spec.question_type,
+        page_number=page,
+        answer_text=record.get("extracted_answer", "") or "",
+        golden_answer=spec.golden_answer,
+        rubric=spec.criteria,
+        max_marks=spec.max_marks,
+        awarded_marks=float(record["awarded_marks"]),
+        confidence=confidence,
+        needs_review=bool(record.get("needs_review")),
+        flag_reasons=rule_flags,
+        evidence=list(evidence),
+        reasoning=reasoning,
+        llm_reasoning=None,
+        llm_model=record.get("llm_model"),
+        status=record.get("status") or "scored",
+        criteria_scores=list(record.get("criteria_scores") or []),
+        evaluator_snapshot={
+            "evaluator": "deterministic" if is_mcq else "llm",
+            "source": SOURCE,
+        },
+    )
+    return result, rule_flags
 
 
 def main() -> None:
@@ -89,119 +185,137 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--merged", type=Path, default=PROCESSED_DIR / "results_merged.json")
+    parser.add_argument(
+        "--index", type=Path, default=PROCESSED_DIR / "extracted_answers_index.json"
+    )
     parser.add_argument("--exam-name", default=EXAM_NAME_DEFAULT)
+    parser.add_argument(
+        "--review-threshold",
+        type=float,
+        default=None,
+        help="Review confidence threshold for the exam (default: the results file's summary).",
+    )
     args = parser.parse_args()
 
     payload = json.loads(args.merged.read_text(encoding="utf-8"))
     results = payload["results"]
     print(f"Loaded {len(results)} graded records from {args.merged}", flush=True)
+    pages = _load_pages(args.index)
 
-    exam_id = _find_or_create_exam(args.exam_name)
-    print(f"Exam: {args.exam_name!r} ({exam_id})", flush=True)
+    settings.ensure_data_dirs()
+    db = Database.from_settings(settings)
+    try:
+        db.check_schema()
+        exams = ExamRepository(db)
+        scripts = ScriptRepository(db, settings.upload_dir)
+        extractions = ExtractionRepository(db)
+        evaluations = EvaluationRepository(db)
 
-    questions = _build_question_bank(results)
-    # The exam's review threshold is part of its configuration; take the one the
-    # grading run used so the imported exam flags exactly what the eval flagged.
-    review_threshold = (payload.get("summary") or {}).get("review_confidence_threshold")
-    EXAMS.update(exam_id, questions=questions, review_confidence_threshold=review_threshold)
-    print(
-        f"Answer key set: {len(questions)} questions"
-        + (f", review threshold {review_threshold}" if review_threshold is not None else ""),
-        flush=True,
-    )
+        existing = exams.find_by_name(args.exam_name)
+        exam_id = str((existing or exams.create(args.exam_name))["exam_id"])
+        print(f"Exam: {args.exam_name!r} ({exam_id})", flush=True)
 
-    by_student: dict[str, list[dict[str, Any]]] = {}
-    for r in results:
-        by_student.setdefault(r["student_id"], []).append(r)
+        questions = _build_question_bank(results)
+        # The review threshold is part of the exam's configuration; use the one the grading
+        # run used so the imported exam flags what the benchmark flagged.
+        review_threshold = args.review_threshold
+        if review_threshold is None:
+            review_threshold = (payload.get("summary") or {}).get("review_confidence_threshold")
+        if review_threshold is None:
+            print(
+                "Note: the results file records no review threshold, so the exam keeps its "
+                "current one. Pass --review-threshold to match your grading run.",
+                flush=True,
+            )
+        exam = exams.update(
+            exam_id, questions=questions, review_confidence_threshold=review_threshold
+        )
+        if exam is None:
+            raise SystemExit("The exam disappeared while importing.")
+        threshold = float(exam["review_confidence_threshold"])
+        specs = {q["question_id"]: QuestionSpec.from_mapping(q) for q in questions}
+        print(
+            f"Answer key set: {len(questions)} questions, review threshold {threshold}", flush=True
+        )
 
-    with get_db() as conn:
+        by_student: dict[str, list[dict[str, Any]]] = {}
+        for r in results:
+            by_student.setdefault(r["student_id"], []).append(r)
+
         for student_id, records in sorted(
             by_student.items(), key=lambda kv: int(kv[0].split("_")[1])
         ):
-            script_id = f"mendeley-{student_id}"
-            pdf_path = STUDENT_PDF_DIR / f"{student_id}.pdf"
+            script_id = _script_id(exam_id, student_id)
+            pdf = STUDENT_PDF_DIR / f"{student_id}.pdf"
+            local = settings.upload_dir / f"{script_id}.pdf"
 
-            conn.execute(
-                "INSERT OR IGNORE INTO students(student_id, name) VALUES (?, ?)",
-                (student_id, student_id.replace("_", " ")),
-            )
-            conn.execute(
-                """
-                INSERT INTO scripts(script_id, student_id, filename, file_path, status, exam_id)
-                VALUES (?, ?, ?, ?, 'processed', ?)
-                ON CONFLICT(script_id) DO UPDATE SET exam_id=excluded.exam_id
-                """,
-                (script_id, student_id, f"{student_id}.pdf", str(pdf_path), exam_id),
-            )
+            if not local.is_file():
+                if pdf.is_file():
+                    shutil.copy2(pdf, local)
+                else:
+                    print(f"  WARNING {student_id}: PDF not found at {pdf}", flush=True)
 
+            page_count = None
+            if local.is_file():
+                with pymupdf.open(local) as doc:
+                    page_count = doc.page_count
+
+            # One transaction per student: a handful of round trips however many answers there
+            # are (the database is remote), and a student is imported completely or not at all.
+            extraction_rows: list[dict[str, Any]] = []
+            grades: list[tuple[QuestionSpec, GradeResult, list[str]]] = []
             for r in records:
                 qid = r["question_id"]
-                is_mcq = r["question_type"] == "MCQ"
-                answer_text = r.get("extracted_answer", "")
-
-                # The script-detail / review-queue views read the student's answer
-                # text from question_extractions, not question_evaluations — populate both.
-                conn.execute(
-                    """
-                    INSERT INTO question_extractions
-                        (extraction_id, script_id, question_id, source_path, page_number,
-                         extracted_text, extraction_method)
-                    VALUES (?, ?, ?, NULL, NULL, ?, 'mendeley_offline_batch')
-                    ON CONFLICT(script_id, question_id) DO UPDATE SET
-                        extracted_text=excluded.extracted_text,
-                        extraction_method=excluded.extraction_method
-                    """,
-                    (f"{script_id}:{qid}:extraction", script_id, qid, answer_text),
+                page = pages.get((student_id, qid))
+                extraction_rows.append(
+                    {
+                        "question_id": qid,
+                        "extracted_text": r.get("extracted_answer", "") or "",
+                        "page_numbers": [page] if page else [],
+                        "question_number": _question_number(qid),
+                        "model": SOURCE,
+                    }
                 )
+                result, rule_flags = _grade_result(r, specs[qid], page, threshold)
+                grades.append((specs[qid], result, rule_flags))
 
-                reasoning = r.get("reasoning") or (r.get("review_reason", "") if is_mcq else "")
-                evidence = r.get("evidence") or (
-                    [r["review_reason"]] if is_mcq and r.get("review_reason") else []
-                )
-
-                conn.execute(
-                    """
-                    INSERT INTO question_evaluations
-                        (eval_id, script_id, question_id, question_text, golden_answer, rubric_json,
-                         max_marks, awarded_marks, confidence, needs_review, status,
-                         evidence_json, reasoning, llm_model, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                    ON CONFLICT(script_id, question_id) DO UPDATE SET
-                        question_text=excluded.question_text,
-                        golden_answer=excluded.golden_answer,
-                        rubric_json=excluded.rubric_json,
-                        max_marks=excluded.max_marks,
-                        awarded_marks=excluded.awarded_marks,
-                        confidence=excluded.confidence,
-                        needs_review=excluded.needs_review,
-                        status=excluded.status,
-                        evidence_json=excluded.evidence_json,
-                        reasoning=excluded.reasoning,
-                        llm_model=excluded.llm_model,
-                        updated_at=datetime('now')
-                    """,
-                    (
-                        f"{script_id}:{qid}",
+            with db.connection() as conn:
+                if scripts.get(script_id, conn) is None:
+                    scripts.insert(
                         script_id,
-                        qid,
-                        r.get("question_text", ""),
-                        r.get("golden_answer", ""),
-                        json.dumps(r.get("rubric", [])),
-                        r["max_marks"],
-                        r["awarded_marks"],
-                        r["confidence"],
-                        int(bool(r["needs_review"])),
-                        r["status"],
-                        json.dumps(evidence),
-                        reasoning,
-                        r.get("llm_model"),
-                    ),
-                )
+                        student_id,
+                        pdf.name,
+                        str(local),
+                        exam_id,
+                        student_name=student_id.replace("_", " "),
+                        conn=conn,
+                    )
+                scripts.set_status(script_id, "processed", page_count=page_count, conn=conn)
+                extractions.upsert_many(script_id, extraction_rows, conn=conn)
+                evaluations.upsert_many(script_id, grades, conn=conn)
 
             print(f"  {student_id}: {len(records)} questions imported", flush=True)
 
+        # Reconcile: the imported exam should flag what the benchmark flagged.
+        benchmark_flagged = sum(1 for r in results if r.get("needs_review"))
+        queued = len(evaluations.review_queue(exam_id))
+        print(
+            f"\nThe benchmark flagged {benchmark_flagged} answers; the review queue now "
+            f"holds {queued}.",
+            flush=True,
+        )
+        if queued != benchmark_flagged:
+            print(
+                "These differ: check --review-threshold, or whether teacher-approved marks "
+                "from an earlier import account for it.",
+                flush=True,
+            )
+    finally:
+        db.close()
+
     print(
-        f"\nDone. Open the app -> Exams -> {args.exam_name!r} to see all 50 students.", flush=True
+        f"\nDone. Open the app -> Exams -> {args.exam_name!r} to see all {len(by_student)} students.",
+        flush=True,
     )
 
 

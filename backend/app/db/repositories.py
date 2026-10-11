@@ -129,6 +129,7 @@ class ScriptRepository:
         exam_id: str,
         file_sha256: str | None = None,
         student_name: str | None = None,
+        conn: Connection | None = None,
     ) -> None:
         """Add a script to an exam. Raises ScriptConflict for a second script by the same
         student or a byte-identical file, and LookupError for an unknown exam or student.
@@ -141,7 +142,7 @@ class ScriptRepository:
         if script_uuid is None:
             raise ValueError("script_id must be a UUID")
         try:
-            with self.db.use() as c:
+            with self.db.use(conn) as c:
                 if student_name is not None:
                     StudentRepository(self.db).upsert(student_id, student_name, c)
                 cursor = c.execute(
@@ -194,6 +195,7 @@ class ScriptRepository:
         status: str,
         page_count: int | None = None,
         error: str | None = None,
+        conn: Connection | None = None,
     ) -> None:
         """Set the pipeline status (uploaded / processing / processed / error) and set or
         clear the error. page_count is only changed when given. Whether a script is graded or
@@ -201,7 +203,7 @@ class ScriptRepository:
         script_uuid = as_uuid(script_id)
         if script_uuid is None:
             return
-        with self.db.use() as c:
+        with self.db.use(conn) as c:
             c.execute(
                 "update scripts set status = %s::script_status, "
                 "page_count = coalesce(%s, page_count), error = %s where id = %s",
@@ -266,20 +268,68 @@ class ExtractionRepository:
         prompt_version: str | None = None,
         flags: list[str] | None = None,
         answer_state: str | None = None,
+        conn: Connection | None = None,
     ) -> None:
         """Store one answer. ``answer_state`` is derived from the text unless given
         ('not_found' marks an exam question the model never found on any page)."""
+        self.upsert_many(
+            script_id,
+            [
+                {
+                    "question_id": question_id,
+                    "extracted_text": extracted_text,
+                    "page_numbers": page_numbers,
+                    "question_number": question_number,
+                    "confidence": confidence,
+                    "model": model,
+                    "prompt_version": prompt_version,
+                    "flags": flags,
+                    "answer_state": answer_state,
+                }
+            ],
+            conn=conn,
+        )
+
+    def upsert_many(
+        self, script_id: str, rows: list[dict[str, Any]], conn: Connection | None = None
+    ) -> None:
+        """Store many answers for one script in a single statement. Each row takes the keyword
+        arguments of ``upsert`` plus ``question_id`` and ``extracted_text``. One round trip
+        however many answers there are, which matters against a remote database."""
         script_uuid = as_uuid(script_id)
         if script_uuid is None:
             raise LookupError("Script not found")
-        state = answer_state or ("answered" if extracted_text.strip() else "blank")
-        with self.db.use() as c:
+        payload: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            text = row.get("extracted_text") or ""
+            confidence = row.get("confidence")
+            payload[row["question_id"]] = {
+                "question_id": row["question_id"],
+                "question_number": row.get("question_number"),
+                "page_numbers": list(row.get("page_numbers") or []),
+                "extracted_text": text,
+                "answer_state": row.get("answer_state")
+                or ("answered" if text.strip() else "blank"),
+                "confidence": None if confidence is None else _clamp(confidence, 0.0, 1.0),
+                "model": row.get("model"),
+                "prompt_version": row.get("prompt_version"),
+                "flags": list(row.get("flags") or []),
+            }
+        if not payload:
+            return
+        with self.db.use(conn) as c:
             c.execute(
                 """
                 insert into extractions
                     (script_id, question_id, question_number, page_numbers, extracted_text,
                      answer_state, confidence, model, prompt_version, flags)
-                values (%s, %s, %s, %s::integer[], %s, %s::answer_state, %s, %s, %s, %s::text[])
+                select %(script)s::uuid, t.question_id, t.question_number, t.page_numbers,
+                       t.extracted_text, t.answer_state::answer_state, t.confidence, t.model,
+                       t.prompt_version, t.flags
+                from jsonb_to_recordset(%(rows)s::jsonb) as t(
+                    question_id text, question_number integer, page_numbers integer[],
+                    extracted_text text, answer_state text, confidence double precision,
+                    model text, prompt_version text, flags text[])
                 on conflict (script_id, question_id) do update set
                     question_number = excluded.question_number,
                     page_numbers    = excluded.page_numbers,
@@ -290,18 +340,7 @@ class ExtractionRepository:
                     prompt_version  = excluded.prompt_version,
                     flags           = excluded.flags
                 """,
-                (
-                    script_uuid,
-                    question_id,
-                    question_number,
-                    page_numbers or [],
-                    extracted_text,
-                    state,
-                    None if confidence is None else _clamp(confidence, 0.0, 1.0),
-                    model,
-                    prompt_version,
-                    flags or [],
-                ),
+                {"script": script_uuid, "rows": Jsonb(list(payload.values()))},
             )
 
     def for_script(self, script_id: str, conn: Connection | None = None) -> list[dict[str, Any]]:
@@ -394,52 +433,92 @@ class EvaluationRepository:
         conn: Connection | None = None,
     ) -> None:
         """Store a grade, replacing an earlier AI grade for the same answer. A teacher's
-        decision is final: the WHERE clause makes a re-grade (from any path: jobs, the
-        per-script endpoint) leave a teacher-approved answer untouched.
+        decision is final: a re-grade (from any path: jobs, the per-script endpoint) leaves a
+        teacher-approved answer untouched.
 
         ``rule_flags`` are the reasons that do not depend on confidence; the confidence flag
         is derived when the grade is read, so it is not stored."""
+        self.upsert_many(script_id, [(spec, result, rule_flags or [])], job_id=job_id, conn=conn)
+
+    def upsert_many(
+        self,
+        script_id: str,
+        grades: list[tuple[QuestionSpec, GradeResult, list[str]]],
+        *,
+        job_id: str | None = None,
+        conn: Connection | None = None,
+    ) -> None:
+        """Store many grades for one script in two statements (an existence check, then one
+        insert), however many questions there are. Each item is (question, result, rule_flags).
+        Raises LookupError if any question is not part of the script's exam.
+
+        The WHERE clause on the conflict update is what keeps a teacher-approved answer
+        untouched."""
         script_uuid = as_uuid(script_id)
         if script_uuid is None:
             raise LookupError("Script not found")
-        marks = round(_clamp(result.awarded_marks, 0.0, spec.max_marks), 2)
-        snapshot = {
-            "question_text": spec.question_text,
-            "question_type": spec.question_type,
-            "golden_answer": spec.golden_answer,
-            "rubric": spec.criteria,
-            "options": spec.options,
-            "guidance": spec.guidance,
-            "max_marks": spec.max_marks,
-            "answer_text": result.answer_text,
-            "page_number": result.page_number,
-            "evaluator": result.evaluator_snapshot,
-        }
+        payload: dict[str, dict[str, Any]] = {}
+        for spec, result, rule_flags in grades:
+            payload[spec.question_id] = {
+                "question_id": spec.question_id,
+                "kind": _grader_kind(result),
+                "max_marks": spec.max_marks,
+                "marks": round(_clamp(result.awarded_marks, 0.0, spec.max_marks), 2),
+                "confidence": _clamp(result.confidence, 0.0, 1.0),
+                "flags": list(rule_flags),
+                "reasoning": result.reasoning,
+                "evidence": result.evidence,
+                "criteria": result.criteria_scores,
+                "llm": result.llm_reasoning,
+                # Exactly what was graded, so review screens show what the model was given.
+                "snapshot": {
+                    "question_text": spec.question_text,
+                    "question_type": spec.question_type,
+                    "golden_answer": spec.golden_answer,
+                    "rubric": spec.criteria,
+                    "options": spec.options,
+                    "guidance": spec.guidance,
+                    "max_marks": spec.max_marks,
+                    "answer_text": result.answer_text,
+                    "page_number": result.page_number,
+                    "evaluator": result.evaluator_snapshot,
+                },
+                "model": result.llm_model,
+            }
+        if not payload:
+            return
         with self.db.use(conn) as c:
-            target = c.execute(
-                """
-                select q.id as exam_question_id,
-                       (select x.id from extractions x
-                         where x.script_id = s.id and x.question_id = q.question_id)
-                         as extraction_id
-                from scripts s
-                join exam_questions q on q.exam_id = s.exam_id and q.question_id = %s
-                where s.id = %s
-                """,
-                (spec.question_id, script_uuid),
-            ).fetchone()
-            if target is None:
-                raise LookupError(f"Question {spec.question_id} is not part of this script's exam")
+            known = {
+                r["question_id"]
+                for r in c.execute(
+                    "select q.question_id from scripts s "
+                    "join exam_questions q on q.exam_id = s.exam_id "
+                    "where s.id = %s and q.question_id = any(%s::text[])",
+                    (script_uuid, list(payload)),
+                )
+            }
+            missing = sorted(set(payload) - known)
+            if missing:
+                raise LookupError(
+                    f"Question {', '.join(missing)} is not part of this script's exam"
+                )
             c.execute(
                 """
                 insert into evaluations
                     (script_id, exam_question_id, extraction_id, job_id, grader_kind, max_marks,
                      ai_marks, final_marks, confidence, flag_reasons, reasoning, evidence,
                      criteria_scores, llm_output, grading_snapshot, model)
-                values (%(script)s, %(question)s, %(extraction)s, %(job)s,
-                        %(kind)s::grader_kind, %(max)s, %(marks)s, %(marks)s, %(confidence)s,
-                        %(flags)s::text[], %(reasoning)s, %(evidence)s, %(criteria)s,
-                        %(llm)s, %(snapshot)s, %(model)s)
+                select s.id, q.id, x.id, %(job)s::uuid, t.kind::grader_kind, t.max_marks,
+                       t.marks, t.marks, t.confidence, t.flags, t.reasoning,
+                       coalesce(t.evidence, '[]'::jsonb), coalesce(t.criteria, '[]'::jsonb),
+                       t.llm, coalesce(t.snapshot, '{}'::jsonb), t.model
+                from jsonb_to_recordset(%(rows)s::jsonb) as t(
+                    question_id text, kind text, max_marks numeric, marks numeric,
+                    confidence double precision, flags text[], reasoning text, evidence jsonb,
+                    criteria jsonb, llm jsonb, snapshot jsonb, model text)
+                join scripts s on s.id = %(script)s::uuid
+                join exam_questions q on q.exam_id = s.exam_id and q.question_id = t.question_id
+                left join extractions x on x.script_id = s.id and x.question_id = t.question_id
                 on conflict (script_id, exam_question_id) do update set
                     extraction_id    = excluded.extraction_id,
                     job_id           = excluded.job_id,
@@ -462,22 +541,8 @@ class EvaluationRepository:
                 """,
                 {
                     "script": script_uuid,
-                    "question": target["exam_question_id"],
-                    "extraction": target["extraction_id"],
                     "job": as_uuid(job_id) if job_id else None,
-                    "kind": _grader_kind(result),
-                    "max": spec.max_marks,
-                    "marks": marks,
-                    "confidence": _clamp(result.confidence, 0.0, 1.0),
-                    "flags": rule_flags or [],
-                    "reasoning": result.reasoning,
-                    "evidence": Jsonb(result.evidence),
-                    "criteria": Jsonb(result.criteria_scores),
-                    "llm": (
-                        Jsonb(result.llm_reasoning) if result.llm_reasoning is not None else None
-                    ),
-                    "snapshot": Jsonb(snapshot),
-                    "model": result.llm_model,
+                    "rows": Jsonb(list(payload.values())),
                 },
             )
 
